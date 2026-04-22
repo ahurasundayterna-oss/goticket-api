@@ -7,7 +7,7 @@ const cors    = require("cors");
  MONNIFY WEBHOOK (MUST COME FIRST)
  ─────────────────────────────────────────
 */
-app.use("/api/monnify/webhook", require("./routes/monnifyWebhook"));
+app.use("/api/monnify/webhook", require("./routes/monnifywebhook"));
 
 /*
  ─────────────────────────────────────────
