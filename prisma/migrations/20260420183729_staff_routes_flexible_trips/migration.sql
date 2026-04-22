@@ -1,0 +1,8 @@
+-- AlterTable
+ALTER TABLE "Park" ADD COLUMN     "deletedAt" TIMESTAMP(3),
+ADD COLUMN     "location" TEXT,
+ADD COLUMN     "status" TEXT NOT NULL DEFAULT 'ACTIVE';
+
+-- AlterTable
+ALTER TABLE "User" ADD COLUMN     "suspended" BOOLEAN NOT NULL DEFAULT false,
+ALTER COLUMN "role" SET DEFAULT 'BRANCH_ADMIN';

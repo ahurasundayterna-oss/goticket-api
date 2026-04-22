@@ -1,0 +1,174 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Park {
+  id   String @id @default(uuid())
+  name String
+
+  // SUPER ADMIN CONTROL
+  status    String    @default("ACTIVE") // ACTIVE | SUSPENDED | DELETED
+  location  String?
+  deletedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  branches Branch[]
+}
+
+model Branch {
+  id     String @id @default(cuid())
+  name   String
+  parkId String
+  park   Park   @relation(fields: [parkId], references: [id])
+
+  // Relations (REQUIRED)
+  users    User[]
+  routes   Route[]
+  trips    Trip[]
+  bookings Booking[]
+
+  // Monnify split settlement
+  monnifySubAccountCode String?
+}
+
+model User {
+  id       String @id @default(uuid())
+  name     String
+  email    String @unique
+  password String
+
+  role String @default("BRANCH_ADMIN")
+
+  suspended Boolean @default(false)
+
+  branchId String?
+  branch   Branch? @relation(fields: [branchId], references: [id])
+
+  bookingsCreated  Booking[] // 👈 ADD THIS
+  routeAssignments RouteStaffAssignment[]
+  seatLocks        SeatLock[]
+
+  createdAt DateTime @default(now())
+  Trip      Trip[]
+}
+
+// ================= ROUTE MODEL =================
+model Route {
+  id          String @id @default(uuid())
+  origin      String
+  destination String
+  price       Float
+
+  active Boolean @default(true)
+
+  branchId String
+  branch   Branch @relation(fields: [branchId], references: [id])
+
+  trips Trip[]
+
+  staffAssignments RouteStaffAssignment[] // 👈 ADD
+
+  createdAt DateTime @default(now())
+
+  @@unique([branchId, origin, destination])
+}
+
+// ================= TRIP MODEL =================
+model Trip {
+  id String @id @default(cuid())
+
+  branchId    String
+  routeId     String
+  createdById String
+
+  departureCity String
+  destination   String
+
+  tripType      String    @default("SCHEDULED")
+  departureTime DateTime?
+
+  price         Float
+  totalSeats    Int
+  fillThreshold Int?
+
+  status String @default("OPEN")
+
+   seatsBooked   Int      @default(0)  // 👈 ADD THIS
+
+
+  createdAt DateTime @default(now())
+
+  // 🔥 RELATIONS (THIS FIXES YOUR ERROR)
+  branch    Branch @relation(fields: [branchId], references: [id])
+  route     Route  @relation(fields: [routeId], references: [id])
+  createdBy User   @relation(fields: [createdById], references: [id])
+
+  bookings  Booking[]
+  seatLocks SeatLock[]
+}
+
+model Booking {
+  id             String   @id @default(cuid())
+  reference      String   @unique
+  passengerName  String
+  passengerPhone String
+  seatNumber     Int
+  bookingSource  String   @default("MANUAL")
+  tripId         String
+  branchId       String
+  createdAt      DateTime @default(now())
+  status         String   @default("PENDING")
+
+  trip   Trip   @relation(fields: [tripId], references: [id])
+  branch Branch @relation(fields: [branchId], references: [id])
+
+  createdById String?
+  createdBy   User?   @relation(fields: [createdById], references: [id])
+
+  // WhatsApp payment fields
+  paymentStatus    String?
+  paidAt           DateTime?
+  accountNumber    String?
+  bankName         String?
+  paymentReference String?
+  totalAmount      Float?
+
+  // ✅ ADD THESE
+  nextOfKinName  String?
+  nextOfKinPhone String?
+}
+
+model SeatLock {
+  id String @id @default(uuid())
+
+  tripId String
+  trip   Trip   @relation(fields: [tripId], references: [id])
+
+  seatNumber Int
+  expiresAt  DateTime
+
+  lockedById String?
+  lockedBy   User?   @relation(fields: [lockedById], references: [id])
+
+  createdAt DateTime @default(now())
+}
+
+model RouteStaffAssignment {
+  id String @id @default(uuid())
+
+  routeId String
+  route   Route  @relation(fields: [routeId], references: [id])
+
+  staffId String
+  staff   User   @relation(fields: [staffId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@unique([routeId, staffId])
+}

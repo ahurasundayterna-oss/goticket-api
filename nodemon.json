@@ -1,0 +1,6 @@
+{
+  "ignore": [
+    "auth/*",
+    "qr.png"
+  ]
+}
