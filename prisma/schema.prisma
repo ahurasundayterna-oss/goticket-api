@@ -27,13 +27,15 @@ model Branch {
   parkId String
   park   Park   @relation(fields: [parkId], references: [id])
 
-  // Relations (REQUIRED)
+  suspended Boolean @default(false)
+
+  createdAt DateTime @default(now()) // ✅ ADD THIS
+
   users    User[]
   routes   Route[]
   trips    Trip[]
   bookings Booking[]
 
-  // Monnify split settlement
   monnifySubAccountCode String?
 }
 

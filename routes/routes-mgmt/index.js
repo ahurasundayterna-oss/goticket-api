@@ -16,33 +16,29 @@ router.use(auth);
 ══════════════════════════════════════════════ */
 router.get("/", async (req, res) => {
   try {
-    const { branchId, role, id: userId, assignedRouteIds } = req.user;
+    const { branchId, role, assignedRouteIds } = req.user;
 
     let routes;
 
     if (role === "BRANCH_ADMIN") {
-      // Admin sees all routes for the branch
       routes = await prisma.route.findMany({
         where:   { branchId, active: true },
         include: {
           staffAssignments: {
-            include: { staff: { select: { id:true, name:true, email:true } } }
+            include: { staff: { select: { id: true, name: true, email: true } } }
           },
           _count: { select: { trips: true } }
         },
         orderBy: { createdAt: "asc" }
       });
     } else {
-      // Staff only see their assigned routes
       routes = await prisma.route.findMany({
         where: {
           branchId,
           active: true,
           id: { in: assignedRouteIds || [] }
         },
-        include: {
-          _count: { select: { trips: true } }
-        },
+        include: { _count: { select: { trips: true } } },
         orderBy: { origin: "asc" }
       });
     }
@@ -107,6 +103,7 @@ router.patch("/:id/deactivate", requireBranchAdmin, async (req, res) => {
 /* ══════════════════════════════════════════════
    DELETE /api/routes/:id
    Branch Admin only — hard delete (only if no trips)
+   FIX: was prisma.staffRoute — corrected to prisma.routeStaffAssignment
 ══════════════════════════════════════════════ */
 router.delete("/:id", requireBranchAdmin, async (req, res) => {
   try {
@@ -119,9 +116,10 @@ router.delete("/:id", requireBranchAdmin, async (req, res) => {
       return res.status(400).json({ message: "Cannot delete route with existing trips. Deactivate it instead." });
     }
 
-    // Also remove all staff assignments
-    await prisma.staffRoute.deleteMany({ where: { routeId: route.id } });
+    // FIX: prisma.staffRoute → prisma.routeStaffAssignment
+    await prisma.routeStaffAssignment.deleteMany({ where: { routeId: route.id } });
     await prisma.route.delete({ where: { id: route.id } });
+
     res.json({ message: "Route deleted" });
   } catch (err) {
     console.error("DELETE ROUTE ERROR:", err);
@@ -141,49 +139,49 @@ router.post("/:id/assign", requireBranchAdmin, async (req, res) => {
 
     if (!staffId) return res.status(400).json({ message: "staffId required" });
 
-    // Verify route belongs to this branch
     const route = await prisma.route.findFirst({
       where: { id: req.params.id, branchId }
     });
     if (!route) return res.status(404).json({ message: "Route not found" });
 
-    // Verify staff belongs to this branch
     const staff = await prisma.user.findFirst({
       where: { id: staffId, branchId, role: "STAFF" }
     });
     if (!staff) return res.status(404).json({ message: "Staff member not found in this branch" });
 
-    // Upsert — safe to call even if already assigned
-   await prisma.routeStaffAssignment.upsert({
-  where: {
-    routeId_staffId: {
-      routeId: route.id,
-      staffId
-    }
-  },
-  update: {},
-  create: {
-    staffId,
-    routeId: route.id
-  }
-});
+    await prisma.routeStaffAssignment.upsert({
+      where:  { routeId_staffId: { routeId: route.id, staffId } },
+      update: {},
+      create: { staffId, routeId: route.id }
+    });
 
-res.json({ message: `${staff.name} assigned to ${route.origin} → ${route.destination}` });
-} catch (err) {
-  console.error("ASSIGN ROUTE ERROR:", err);
-  res.status(500).json({ message: "Failed to assign route" });
-}
+    res.json({ message: `${staff.name} assigned to ${route.origin} → ${route.destination}` });
+  } catch (err) {
+    console.error("ASSIGN ROUTE ERROR:", err);
+    res.status(500).json({ message: "Failed to assign route" });
+  }
 });
 
 /* ══════════════════════════════════════════════
    DELETE /api/routes/:id/assign/:staffId
    Branch Admin removes a staff assignment
+   FIX: was prisma.staffRoute — corrected to prisma.routeStaffAssignment
 ══════════════════════════════════════════════ */
 router.delete("/:id/assign/:staffId", requireBranchAdmin, async (req, res) => {
   try {
-    await prisma.staffRoute.deleteMany({
+    const { branchId } = req.user;
+
+    // Verify route belongs to this branch before removing assignment
+    const route = await prisma.route.findFirst({
+      where: { id: req.params.id, branchId }
+    });
+    if (!route) return res.status(404).json({ message: "Route not found" });
+
+    // FIX: prisma.staffRoute → prisma.routeStaffAssignment
+    await prisma.routeStaffAssignment.deleteMany({
       where: { routeId: req.params.id, staffId: req.params.staffId }
     });
+
     res.json({ message: "Assignment removed" });
   } catch (err) {
     console.error("REMOVE ASSIGNMENT ERROR:", err);
