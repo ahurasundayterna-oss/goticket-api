@@ -26,7 +26,7 @@ app.use("/api/parks",     require("./routes/parks"));
 app.use("/api/branches",  require("./routes/branches"));
 app.use("/api/users",     require("./routes/users"));
 app.use("/api/setup",     require("./routes/setup"));
-app.use("/api/super", require("./routes/super"));
+app.use("/api/super", require("./routes/super/index"));
 
 
 // ── Updated routes ─────────────────────────────────────────────
