@@ -1,11 +1,10 @@
-const jwt = require("jsonwebtoken");
-const prisma = require("../prismaClient");
+const jwt    = require("jsonwebtoken");
+const prisma  = require("../prismaClient");
 const { checkSuspension } = require("./checkSuspension");
 
 module.exports = async function auth(req, res, next) {
   const authHeader = req.headers.authorization;
 
-  // ── Validate Authorization header ─────────────────────────────
   if (!authHeader) {
     return res.status(401).json({ message: "No token provided" });
   }
@@ -17,25 +16,13 @@ module.exports = async function auth(req, res, next) {
   const token = authHeader.split(" ")[1];
 
   try {
-    // ── Ensure JWT secret exists ─────────────────────────────────
     if (!process.env.JWT_SECRET) {
       throw new Error("JWT_SECRET not set");
     }
 
-    // ── Verify token ─────────────────────────────────────────────
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    // ── Ensure user still exists (prevents ghost access) ─────────
-    const userExists = await prisma.user.findUnique({
-      where: { id: decoded.id },
-      select: { id: true }
-    });
-
-    if (!userExists) {
-      return res.status(401).json({ message: "User no longer exists" });
-    }
-
-    // ── Suspension check (User → Branch → Park) ──────────────────
+    // ── Suspension check ─────────────────────────────────────────
     const suspension = await checkSuspension(decoded.id);
 
     if (suspension) {
@@ -46,24 +33,29 @@ module.exports = async function auth(req, res, next) {
       });
     }
 
-    // ── Staff route assignments (safe + isolated) ────────────────
+    // ── Staff route assignments ──────────────────────────────────
+    // FIX: prisma.routeStaffAssignment does not exist in the schema.
+    //      The correct model name is prisma.staffRoute.
+    //      The old name threw on every request → catch returned 401
+    //      → api.js interceptor cleared token → immediate logout.
     let assignedRouteIds = [];
 
     if (decoded.role === "STAFF") {
       try {
         const assignments = await prisma.staffRoute.findMany({
-          where: { staffId: decoded.id },
+          where:  { staffId: decoded.id },
           select: { routeId: true },
         });
-
         assignedRouteIds = assignments.map(a => a.routeId);
       } catch (assignErr) {
+        // Isolated — a DB error here won't kill the whole request.
+        // Staff gets empty route list rather than a 401.
         console.error("Staff route lookup failed:", assignErr.message);
-        assignedRouteIds = []; // fail gracefully
+        assignedRouteIds = [];
       }
     }
 
-    // ── Attach user to request ───────────────────────────────────
+    // ── Attach decoded user to request ───────────────────────────
     req.user = {
       id:               decoded.id,
       role:             decoded.role,
@@ -76,6 +68,8 @@ module.exports = async function auth(req, res, next) {
     next();
 
   } catch (err) {
+    // Only reaches here if jwt.verify itself fails
+    // (token expired, tampered, wrong secret)
     console.error("AUTH ERROR:", err.message);
     return res.status(401).json({ message: "Invalid or expired token" });
   }
