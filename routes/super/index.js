@@ -58,9 +58,8 @@ router.get("/stats", async (req, res) => {
 router.get("/parks", async (req, res) => {
   try {
     const parks = await prisma.park.findMany({
-      where: { 
-  deletedAt: null,
-  status: "ACTIVE"
+where: { 
+  deletedAt: null
 },
       orderBy: { createdAt: "desc" },
       include: {
