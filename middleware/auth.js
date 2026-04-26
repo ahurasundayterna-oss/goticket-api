@@ -1,63 +1,82 @@
-/**
- * middleware/auth.js
- *
- * CHANGED from previous version:
- *   - Replaces the inline `user.suspended` check with `checkSuspension()`
- *     which walks the full chain: User → Branch → Park.
- *   - Returns 403 with a structured JSON body:
- *       { message: string, suspended: true, level: string }
- *     The `suspended: true` flag lets the frontend distinguish a suspension
- *     403 from a permissions 403, without checking the message string.
- *
- * Everything else (JWT verify, route assignment fetch, req.user shape)
- * is byte-for-byte identical to the previous version.
- */
-
-const jwt    = require("jsonwebtoken");
+const jwt = require("jsonwebtoken");
 const prisma = require("../prismaClient");
 const { checkSuspension } = require("./checkSuspension");
 
 module.exports = async function auth(req, res, next) {
   const authHeader = req.headers.authorization;
+
+  // ── Validate Authorization header ─────────────────────────────
   if (!authHeader) {
     return res.status(401).json({ message: "No token provided" });
+  }
+
+  if (!authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "Invalid token format" });
   }
 
   const token = authHeader.split(" ")[1];
 
   try {
+    // ── Ensure JWT secret exists ─────────────────────────────────
+    if (!process.env.JWT_SECRET) {
+      throw new Error("JWT_SECRET not set");
+    }
+
+    // ── Verify token ─────────────────────────────────────────────
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    // ── Suspension chain check (replaces the old single-field check) ─────────
+    // ── Ensure user still exists (prevents ghost access) ─────────
+    const userExists = await prisma.user.findUnique({
+      where: { id: decoded.id },
+      select: { id: true }
+    });
+
+    if (!userExists) {
+      return res.status(401).json({ message: "User no longer exists" });
+    }
+
+    // ── Suspension check (User → Branch → Park) ──────────────────
     const suspension = await checkSuspension(decoded.id);
 
     if (suspension) {
       return res.status(403).json({
         message:   suspension.reason,
-        suspended: true,          // ← frontend uses this flag
+        suspended: true,
         level:     suspension.level,
       });
     }
 
-    // ── Fetch assigned routes from DB (not from token) — unchanged ───────────
-    const assignments = await prisma.routeStaffAssignment.findMany({
-      where:  { staffId: decoded.id },
-      select: { routeId: true },
-    });
+    // ── Staff route assignments (safe + isolated) ────────────────
+    let assignedRouteIds = [];
 
-    // ── Attach user to request — unchanged ────────────────────────────────────
+    if (decoded.role === "STAFF") {
+      try {
+        const assignments = await prisma.staffRoute.findMany({
+          where: { staffId: decoded.id },
+          select: { routeId: true },
+        });
+
+        assignedRouteIds = assignments.map(a => a.routeId);
+      } catch (assignErr) {
+        console.error("Staff route lookup failed:", assignErr.message);
+        assignedRouteIds = []; // fail gracefully
+      }
+    }
+
+    // ── Attach user to request ───────────────────────────────────
     req.user = {
       id:               decoded.id,
       role:             decoded.role,
       branchId:         decoded.branchId,
       branchName:       decoded.branchName,
       parkName:         decoded.parkName,
-      assignedRouteIds: assignments.map(a => a.routeId),
+      assignedRouteIds,
     };
 
     next();
 
   } catch (err) {
+    console.error("AUTH ERROR:", err.message);
     return res.status(401).json({ message: "Invalid or expired token" });
   }
 };
