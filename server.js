@@ -29,9 +29,12 @@ app.use("/api/setup",     require("./routes/setup"));
 app.use("/api/super", require("./routes/super/index"));
 
 
+
 // ── Updated routes ─────────────────────────────────────────────
 app.use("/api/trips",     require("./routes/trips"));
 app.use("/api/bookings",  require("./routes/bookings"));
+// ── Reports routes ─────────────────────────────────────────────
+app.use("/api/reports", require("./routes/reports"));
 
 // ── New routes ─────────────────────────────────────────────────
 app.use("/api/routes",    require("./routes/routes-mgmt"));
