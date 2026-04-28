@@ -101,6 +101,7 @@ model Booking {
   paymentReference String?
   paymentStatus    String?
   totalAmount      Float?
+  paymentMethod String? // "CASH" | "TRANSFER" | "ONLINE"
   nextOfKinName    String?
   nextOfKinPhone   String?
   status           String    @default("PENDING")

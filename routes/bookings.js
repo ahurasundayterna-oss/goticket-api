@@ -398,4 +398,117 @@ router.get("/:tripId/manifest/print", auth, requireBranchMember, async (req, res
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ADD THIS ROUTE to your existing routes/bookings.js
+// Place it before the module.exports line.
+//
+// This is the ONLY addition needed to bookings.js.
+// All existing routes (GET, POST /manual, cancel, delete, manifest) are untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/* ══════════════════════════════════════════════
+   PATCH /api/bookings/:id/confirm-payment
+   ──────────────────────────────────────────────
+   Confirms payment for a booking manually.
+   Works for BOTH manual and WhatsApp bookings.
+
+   Body (optional): { paymentMethod: "CASH" | "TRANSFER" | "ONLINE" }
+   Default paymentMethod: "CASH"
+
+   Sets:
+     paymentStatus = "PAID"
+     status        = "CONFIRMED"
+     paidAt        = now()
+     paymentMethod = body.paymentMethod || "CASH"
+
+   ── FUTURE PAYSTACK INTEGRATION ────────────────
+   When Paystack is added, this endpoint stays
+   exactly as-is for manual confirmations.
+
+   You will add a NEW route:
+     POST /api/bookings/paystack/webhook
+   That webhook will:
+     1. Verify Paystack signature
+     2. Extract booking reference from event.data.reference
+     3. Call the same DB update logic below (extract it to a shared fn)
+     4. Set paymentMethod = "ONLINE"
+     5. Set paymentReference = event.data.reference
+
+   The booking.paymentReference field is already in
+   your schema waiting for that reference.
+   ────────────────────────────────────────────────
+
+   Auth: Branch Admin or Staff (requireBranchMember)
+   Staff can only confirm bookings they created.
+   Branch Admin can confirm any booking in their branch.
+══════════════════════════════════════════════ */
+router.patch("/:id/confirm-payment", auth, requireBranchMember, async (req, res) => {
+  try {
+    const { role, id: userId, branchId } = req.user;
+    const { paymentMethod = "CASH" } = req.body;
+
+    // Validate paymentMethod
+    const VALID_METHODS = ["CASH", "TRANSFER", "ONLINE"];
+    if (!VALID_METHODS.includes(paymentMethod)) {
+      return res.status(400).json({
+        message: `paymentMethod must be one of: ${VALID_METHODS.join(", ")}`
+      });
+    }
+
+    // Find booking — scoped to this branch
+    const booking = await prisma.booking.findFirst({
+      where: { id: req.params.id, branchId }
+    });
+
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+
+    // Already paid — do not double-confirm
+    if (booking.paymentStatus === "PAID") {
+      return res.status(400).json({ message: "Booking is already confirmed as paid" });
+    }
+
+    // Cancelled bookings cannot be paid
+    if (booking.status === "CANCELLED") {
+      return res.status(400).json({ message: "Cannot confirm payment for a cancelled booking" });
+    }
+
+    // Staff can only confirm bookings they created
+    if (role === "STAFF" && booking.createdById !== userId) {
+      return res.status(403).json({
+        message: "You can only confirm payment for bookings you created"
+      });
+    }
+
+    // ── Update booking ─────────────────────────────────────────────────────
+    // ── FUTURE PAYSTACK: extract this update into a shared confirmPayment(id, method, reference)
+    // ── function so both this route and the Paystack webhook can call it.
+    const updated = await prisma.booking.update({
+      where: { id: booking.id },
+      data: {
+        paymentStatus: "PAID",
+        status:        "CONFIRMED",
+        paidAt:        new Date(),
+        paymentMethod,
+        // paymentReference is left null here — Paystack webhook will set it later
+        // when ONLINE payments are auto-confirmed via webhook
+      },
+      include: {
+        trip:      true,
+        createdBy: { select: { id: true, name: true } }
+      }
+    });
+
+    return res.json({
+      message:  "Payment confirmed successfully",
+      booking:  updated,
+    });
+
+  } catch (err) {
+    console.error("CONFIRM PAYMENT ERROR:", err);
+    return res.status(500).json({ message: "Error confirming payment" });
+  }
+});
+
 module.exports = router;
