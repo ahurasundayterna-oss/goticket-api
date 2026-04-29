@@ -109,6 +109,7 @@ model Booking {
   createdBy         User?     @relation(fields: [createdById], references: [id])
   trip              Trip      @relation(fields: [tripId], references: [id])
   payment           Payment?
+  expiresAt DateTime?
 
   @@index([paymentReference])
   @@index([monnifyReference])
