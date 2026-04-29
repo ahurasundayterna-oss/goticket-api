@@ -38,9 +38,11 @@ router.post(
     const { eventType, eventData } = payload;
 
     // paymentReference = our GoTicket ref (GT-XXXXXX) saved as accountReference
-    const paymentReference = eventData?.accountReference
-      || eventData?.paymentReference
-      || "UNKNOWN";
+    const paymentReference =
+  eventData?.product?.reference ||
+  eventData?.accountReference ||
+  eventData?.paymentReference ||
+  "UNKNOWN";
 
     const transactionReference = eventData?.transactionReference || "";
 
