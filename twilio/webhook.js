@@ -362,26 +362,25 @@ Reply *YES* to confirm or *NO* to cancel.`);
         refs.push(ref);
 
         const created = await prisma.booking.create({
-          data: {
-            passengerName:    session.passengerName,
-            passengerPhone:   session.passengerPhone,
-            seatNumber:       nextSeat,
-            reference:        ref,
-            bookingSource:    "WHATSAPP",
-            tripId:           trip.id,
-            branchId:         trip.branchId,
-            paymentStatus:    "PENDING",
-            status:           "PENDING",
-            paymentMethod:    "ONLINE",
-            totalAmount,
-            expiresAt,                      // ← NEW: seat lock expiry
-            paymentReference: primaryRef,   // all seats share one Monnify reference
-            nextOfKinName:    session.nextOfKinName,
-            nextOfKinPhone:   session.nextOfKinPhone,
-          }
-        });
-        bookingIds.push(created.id);
+  data: {
+    passengerName: session.passengerName,
+    passengerPhone: session.passengerPhone,
+    seatNumber: nextSeat,
+    reference: ref,
+    bookingSource: "WHATSAPP",
+    tripId: trip.id,
+    branchId: trip.branchId,
+    paymentStatus: "PENDING",
+    status: "PENDING",
+    paymentMethod: "ONLINE",
+    totalAmount,
+    paymentReference: primaryRef,
+    nextOfKinName: session.nextOfKinName,
+    nextOfKinPhone: session.nextOfKinPhone,
+  }
+});
 
+bookingIds.push(created.id);
         // ── Create Payment record ──────────────────────────────────────────
         await prisma.payment.create({
           data: {
