@@ -21,7 +21,6 @@ model Branch {
   id                    String    @id @default(cuid())
   name                  String
   parkId                String
-  monnifySubAccountCode String?
   suspended             Boolean   @default(false)
   createdAt             DateTime  @default(now())
   bookings              Booking[]
@@ -85,29 +84,62 @@ model Trip {
 }
 
 model Booking {
-  id               String    @id @default(cuid())
-  passengerName    String
-  passengerPhone   String
-  seatNumber       Int
-  reference        String    @unique
-  bookingSource    String    @default("MANUAL")
-  tripId           String
-  branchId         String
-  createdAt        DateTime  @default(now())
-  createdById      String?
-  accountNumber    String?
-  bankName         String?
-  paidAt           DateTime?
-  paymentReference String?
-  paymentStatus    String?
-  totalAmount      Float?
-  paymentMethod String? // "CASH" | "TRANSFER" | "ONLINE"
-  nextOfKinName    String?
-  nextOfKinPhone   String?
-  status           String    @default("PENDING")
-  branch           Branch    @relation(fields: [branchId], references: [id])
-  createdBy        User?     @relation(fields: [createdById], references: [id])
-  trip             Trip      @relation(fields: [tripId], references: [id])
+  id                String    @id @default(cuid())
+  passengerName     String
+  passengerPhone    String
+  seatNumber        Int
+  reference         String    @unique
+  bookingSource     String    @default("MANUAL")
+  tripId            String
+  branchId          String
+  createdAt         DateTime  @default(now())
+  createdById       String?
+  accountNumber     String?
+  bankName          String?
+  paidAt            DateTime?
+  paymentReference  String?   // GoTicket ref saved to Monnify accountReference
+  monnifyReference  String?   // Monnify's own transactionReference from webhook
+  paymentStatus     String?   // "PENDING" | "PAID" | "FAILED"
+  paymentMethod     String?   // "CASH" | "TRANSFER" | "ONLINE"
+  totalAmount       Float?
+  nextOfKinName     String?
+  nextOfKinPhone    String?
+  status            String    @default("PENDING")
+  branch            Branch    @relation(fields: [branchId], references: [id])
+  createdBy         User?     @relation(fields: [createdById], references: [id])
+  trip              Trip      @relation(fields: [tripId], references: [id])
+  payment           Payment?
+
+  @@index([paymentReference])
+  @@index([monnifyReference])
+  @@index([status])
+  @@index([paymentStatus])
+  @@index([tripId])
+  @@index([branchId])
+}
+
+model Payment {
+  id                String   @id @default(cuid())
+  bookingId         String   @unique
+  provider          String   @default("MONNIFY")
+  providerReference String?
+  amount            Float?
+  status            String   @default("PENDING")
+  rawPayload        String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  booking           Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+}
+
+model WebhookLog {
+  id        String   @id @default(cuid())
+  eventId   String   @unique  // Monnify paymentReference — unique per transaction
+  provider  String   @default("MONNIFY")
+  event     String
+  processed Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([eventId])
 }
 
 model SeatLock {

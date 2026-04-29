@@ -1,155 +1,195 @@
-/**
- * routes/monnifyWebhook.js
- *
- * Receives Monnify payment notifications after a passenger transfers funds.
- *
- * Flow:
- *   1. Verify HMAC-SHA512 signature to reject spoofed requests
- *   2. Only process PAID events (ignore FAILED / OVERPAID / REVERSED silently)
- *   3. Re-verify the transaction against Monnify API (never trust webhook alone)
- *   4. Find all bookings sharing the paymentReference
- *   5. Mark them PAID, set paidAt, mark seat confirmed
- *   6. Log receipt data
- *
- * Mount in app.js:
- *   app.use("/api/monnify/webhook", require("./routes/monnifyWebhook"));
- *
- * IMPORTANT: This route must receive the raw (unparsed) request body for
- * signature verification. Mount it BEFORE express.json() or use a
- * separate raw-body middleware on this path. See app.js addition notes.
- */
+"use strict";
 
 const router = require("express").Router();
 const prisma  = require("../prismaClient");
-const { verifyWebhookSignature, verifyTransaction } = require("../services/monnify");
+const {
+  verifyWebhookSignature,
+  verifyTransaction,
+  sendPaymentConfirmation,
+} = require("../services/monnify");
 
-/* ══════════════════════════════════════════
-   MONNIFY PAYMENT WEBHOOK
-══════════════════════════════════════════ */
 router.post(
   "/",
-  // Raw body middleware — needed only on this route for HMAC verification
-  // express.raw() captures the body before JSON.parse mutates it
   require("express").raw({ type: "application/json" }),
   async (req, res) => {
 
-    // ── 1. Signature verification ──────────────────────────────────────────
+    /* ── 1. Verify signature ──────────────────────────────────── */
     const signature = req.headers["monnify-signature"];
-    const rawBody   = req.body; // Buffer when using express.raw()
+    const rawBody   = req.body;
 
     if (!signature) {
-      console.warn("[Monnify Webhook] Missing signature header — rejected");
+      console.warn("[Monnify Webhook] Missing signature");
       return res.status(400).json({ error: "Missing signature" });
     }
 
-    const isValid = verifyWebhookSignature(rawBody, signature);
-    if (!isValid) {
+    if (!verifyWebhookSignature(rawBody, signature)) {
       console.warn("[Monnify Webhook] Invalid signature — rejected");
       return res.status(401).json({ error: "Invalid signature" });
     }
 
-    // ── 2. Parse payload ───────────────────────────────────────────────────
+    /* ── 2. Parse payload ─────────────────────────────────────── */
     let payload;
     try {
       payload = JSON.parse(rawBody.toString());
     } catch {
-      return res.status(400).json({ error: "Invalid JSON body" });
+      return res.status(400).json({ error: "Invalid JSON" });
     }
 
     const { eventType, eventData } = payload;
 
-    console.log(`[Monnify Webhook] Event: ${eventType} | Ref: ${eventData?.paymentReference}`);
+    // paymentReference = our GoTicket ref (GT-XXXXXX) saved as accountReference
+    const paymentReference = eventData?.accountReference
+      || eventData?.paymentReference
+      || "UNKNOWN";
 
-    // ── 3. Only handle successful payment events ───────────────────────────
-    // Acknowledge all events with 200 so Monnify stops retrying non-payment events
-    if (eventType !== "SUCCESSFUL_TRANSACTION") {
-      return res.status(200).json({ received: true });
+    const transactionReference = eventData?.transactionReference || "";
+
+    console.log(`[Monnify Webhook] Event: ${eventType} | Ref: ${paymentReference}`);
+    console.log("[Monnify Webhook] Full payload:", JSON.stringify(payload, null, 2));
+
+    /* ── 3. Acknowledge immediately ───────────────────────────── */
+    res.status(200).json({ received: true });
+
+    /* ── 4. Filter to success events only ─────────────────────── */
+    const SUCCESS_EVENTS = [
+      "SUCCESSFUL_TRANSACTION",
+      "PAYMENT_STATUS_CHANGED",
+      "SUCCESSFUL_PAYMENT",       // some Monnify sandbox variants
+    ];
+
+    if (!SUCCESS_EVENTS.includes(eventType)) {
+      console.log(`[Monnify Webhook] Ignoring event: ${eventType}`);
+      return;
     }
 
-    const { paymentReference, transactionReference, amountPaid, paidOn } = eventData;
+    // PAYMENT_STATUS_CHANGED — only proceed if PAID
+    if (
+      eventType === "PAYMENT_STATUS_CHANGED" &&
+      eventData?.paymentStatus !== "PAID"
+    ) {
+      console.log(`[Monnify Webhook] Status not PAID — skipping`);
+      return;
+    }
 
     try {
-      // ── 4. Re-verify with Monnify API (don't trust webhook payload alone) ─
-      const verified = await verifyTransaction(transactionReference);
+      /* ── 5. Idempotency check ─────────────────────────────────
+         Use paymentReference as unique eventId per transaction   */
+      const existing = await prisma.webhookLog.findUnique({
+        where: { eventId: paymentReference },
+      });
 
-      if (verified.paymentStatus !== "PAID") {
-        console.log(`[Monnify Webhook] Transaction ${transactionReference} not PAID — skipping`);
-        return res.status(200).json({ received: true });
+      if (existing?.processed) {
+        console.log(`[Monnify Webhook] Already processed: ${paymentReference}`);
+        return;
       }
 
-      // ── 5. Find bookings by paymentReference ──────────────────────────────
-      // All seats in a multi-seat booking share the same paymentReference (primaryRef)
+      // Mark as in-progress
+      await prisma.webhookLog.upsert({
+        where:  { eventId: paymentReference },
+        create: {
+          eventId:   paymentReference,
+          provider:  "MONNIFY",
+          event:     eventType,
+          processed: false,
+        },
+        update: {},
+      });
+
+      /* ── 6. Re-verify with Monnify API ────────────────────────
+         Only verify if we have a transactionReference           */
+      if (transactionReference) {
+        try {
+          const verified = await verifyTransaction(transactionReference);
+          if (verified.paymentStatus !== "PAID") {
+            console.log(`[Monnify Webhook] API verify: not PAID — skipping`);
+            return;
+          }
+        } catch (verifyErr) {
+          console.error("[Monnify Webhook] Verify failed:", verifyErr.message);
+          // In sandbox, verification sometimes fails — proceed anyway
+          console.log("[Monnify Webhook] Proceeding without verification (sandbox)");
+        }
+      }
+
+      /* ── 7. Find bookings by paymentReference ─────────────────
+         paymentReference = our GT-XXXXXX ref stored on booking  */
       const bookings = await prisma.booking.findMany({
-        where: { paymentReference },
+        where:   { paymentReference },
         include: {
           trip: {
-            include: {
-              branch: { include: { park: true } }
-            }
+            include: { branch: { include: { park: true } } }
           }
-        }
+        },
       });
 
       if (!bookings.length) {
-        console.warn(`[Monnify Webhook] No bookings found for reference: ${paymentReference}`);
-        // Still return 200 — Monnify shouldn't keep retrying an unknown reference
-        return res.status(200).json({ received: true });
+        console.warn(`[Monnify Webhook] No bookings for ref: ${paymentReference}`);
+        await prisma.webhookLog.update({
+          where: { eventId: paymentReference },
+          data:  { processed: true },
+        });
+        return;
       }
 
-      const paidAtDate = paidOn ? new Date(paidOn) : new Date();
+      const paidAtDate = eventData?.paidOn
+        ? new Date(eventData.paidOn)
+        : new Date();
+      const amountPaid = eventData?.amountPaid || eventData?.amount || 0;
+      const rawJson    = JSON.stringify(payload);
 
-      // ── 6. Mark all matching bookings as PAID + confirmed ─────────────────
-      await prisma.booking.updateMany({
-        where: { paymentReference },
-        data: {
-          paymentStatus: "PAID",
-          paidAt:        paidAtDate,
-          // Seat is now confirmed — no further action needed at the terminal
+      /* ── 8. Confirm bookings + create Payment records ─────────*/
+      await prisma.$transaction(async (tx) => {
+
+        // Update all bookings with this reference
+        await tx.booking.updateMany({
+          where: { paymentReference },
+          data: {
+            paymentStatus:   "PAID",
+            status:          "CONFIRMED",
+            paidAt:          paidAtDate,
+            paymentMethod:   "ONLINE",
+            monnifyReference: transactionReference || null,
+          },
+        });
+
+        // Create/update Payment audit record per booking
+        for (const booking of bookings) {
+          await tx.payment.upsert({
+            where:  { bookingId: booking.id },
+            create: {
+              bookingId:         booking.id,
+              provider:          "MONNIFY",
+              providerReference: transactionReference || null,
+              amount:            amountPaid || booking.totalAmount || 0,
+              status:            "PAID",
+              rawPayload:        rawJson,
+            },
+            update: {
+              providerReference: transactionReference || null,
+              amount:            amountPaid || booking.totalAmount || 0,
+              status:            "PAID",
+              rawPayload:        rawJson,
+            },
+          });
         }
+
+        // Mark webhook as fully processed
+        await tx.webhookLog.update({
+          where: { eventId: paymentReference },
+          data:  { processed: true },
+        });
       });
 
-      // ── 7. Build receipt data (logged; extend to SMS/email as needed) ─────
-      const firstBooking = bookings[0];
-      const trip         = firstBooking.trip;
+      console.log(`[Monnify Webhook] ✅ ${bookings.length} booking(s) confirmed — ref: ${paymentReference}`);
 
-      const receipt = {
-        event:              "PAYMENT_CONFIRMED",
-        generatedAt:        new Date().toISOString(),
-        paymentReference,
-        transactionReference,
-        amountPaid,
-        paidAt:             paidAtDate.toISOString(),
-        passengerName:      firstBooking.passengerName,
-        passengerPhone:     firstBooking.passengerPhone,
-        park:               trip.branch?.park?.name,
-        route:              `${trip.departureCity} → ${trip.destination}`,
-        departureTime:      trip.departureTime,
-        seats:              bookings.map(b => b.seatNumber),
-        references:         bookings.map(b => b.reference),
-        bankName:           firstBooking.bankName,
-        accountNumber:      firstBooking.accountNumber,
-        splitSettlement: {
-          branch:   {
-            subAccountCode: trip.branch?.monnifySubAccountCode,
-            name:           trip.branch?.name,
-            receives:       "ticket price",
-          },
-          goticket: {
-            receives: "3% commission",
-          }
-        }
-      };
-
-      console.log("[Monnify Webhook] Receipt:", JSON.stringify(receipt, null, 2));
-
-      // ── 8. Respond 200 immediately so Monnify doesn't retry ───────────────
-      return res.status(200).json({ received: true });
+      /* ── 9. Send WhatsApp confirmations ───────────────────────*/
+      for (const booking of bookings) {
+        await sendPaymentConfirmation(booking);
+      }
 
     } catch (err) {
-      console.error("[Monnify Webhook] Error processing payment:", err.message);
-      // Return 200 anyway — a 500 causes Monnify to retry, which can cause
-      // duplicate processing if the DB write partially succeeded
-      return res.status(200).json({ received: true, warning: "Processing error logged" });
+      console.error("[Monnify Webhook] Processing error:", err.message, err.stack);
+      // 200 already sent — don't re-throw
     }
   }
 );

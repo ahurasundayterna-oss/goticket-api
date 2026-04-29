@@ -1,17 +1,14 @@
 /**
- * routes/webhook.js
+ * twilio/webhook.js
  *
- * CHANGED in this version:
- *   - ASK_DATE:     after fetching trips, groups them by park + price and
- *                   advances to SELECT_PARK instead of SELECT_TRIP.
- *   - SELECT_PARK:  NEW step — user picks a park/price option; if that
- *                   selection has multiple departure times the user is sent
- *                   to SELECT_TRIP, otherwise auto-advances to ASK_SEATS.
- *   - SELECT_TRIP:  now shows departure-time options only for the already-
- *                   chosen park, so messages are short.
+ * CHANGED from previous version:
+ *   - CONFIRM step: bookings now store expiresAt (10-minute seat lock)
+ *   - CONFIRM step: creates Payment record alongside each booking
+ *   - createVirtualAccount no longer requires branchSubAccountCode
+ *     (removed split settlement — simplified for now)
+ *   - Error fallback message improved
  *
- *   Everything from ASK_SEATS onward is byte-for-byte identical to the
- *   previous version.
+ * All other steps (MAIN_MENU through ASK_NOK_PHONE) are unchanged.
  */
 
 const router = require("express").Router();
@@ -19,32 +16,26 @@ const prisma  = require("../prismaClient");
 const { parseIntent, resolveDate } = require("../services/nlp");
 const { createVirtualAccount, calculateAmounts } = require("../services/monnify");
 
-/* ══════════════════════════════════════════
-   SESSION STORE  (in-memory; swap for Redis in prod)
-══════════════════════════════════════════ */
 const sessions = new Map();
-
 function getSession(phone) {
   if (!sessions.has(phone)) sessions.set(phone, {});
   return sessions.get(phone);
 }
-function clearSession(phone) {
-  sessions.delete(phone);
-}
+function clearSession(phone) { sessions.delete(phone); }
 
-/* ══════════════════════════════════════════
-   HELPERS
-══════════════════════════════════════════ */
 function twimlReply(res, message) {
   res.type("text/xml");
   res.send(`<Response><Message>${message}</Message></Response>`);
 }
 function formatTime(dateStr) {
-  return new Date(dateStr).toLocaleTimeString("en-NG", { hour:"2-digit", minute:"2-digit" });
+  return new Date(dateStr).toLocaleTimeString("en-NG", {
+    hour: "2-digit", minute: "2-digit", timeZone: "Africa/Lagos",
+  });
 }
 function formatDate(dateStr) {
   return new Date(dateStr).toLocaleDateString("en-NG", {
-    weekday:"long", day:"numeric", month:"long", year:"numeric",
+    weekday: "long", day: "numeric", month: "long", year: "numeric",
+    timeZone: "Africa/Lagos",
   });
 }
 function formatCurrency(amount) {
@@ -76,103 +67,58 @@ function isValidPhone(phone) {
   return /^\+?[0-9]{7,15}$/.test(phone.replace(/\s/g,""));
 }
 
-/* ══════════════════════════════════════════
-   NEW HELPER — build park/price option list
-   ──────────────────────────────────────────
-   Groups a flat trips array into unique
-   (parkName, price) combinations.
-
-   Returns an array of option objects:
-   [
-     {
-       label:  "Benue Links — ₦30,000",
-       park:   "Benue Links",
-       price:  30000,
-       trips:  [ ...trip objects with this park+price ]
-     },
-     ...
-   ]
-   Sorted by price ascending, then park name.
-══════════════════════════════════════════ */
 function buildParkOptions(trips) {
   const map = new Map();
-
   for (const trip of trips) {
     const parkName = trip.branch?.park?.name || "Unknown";
     const key      = `${parkName}::${trip.price}`;
-
     if (!map.has(key)) {
       map.set(key, {
         label: `${parkName} — ${formatCurrency(trip.price)}`,
-        park:  parkName,
-        price: trip.price,
-        trips: [],
+        park: parkName, price: trip.price, trips: [],
       });
     }
     map.get(key).trips.push(trip);
   }
-
-  // Sort: price ascending, then park name alphabetically
   return Array.from(map.values()).sort((a, b) => {
     if (a.price !== b.price) return a.price - b.price;
     return a.park.localeCompare(b.park);
   });
 }
 
-/* ══════════════════════════════════════════
-   NLU PRE-PROCESSOR  (unchanged)
-══════════════════════════════════════════ */
 function applyNLU(rawMsg, session) {
   const parsed = parseIntent(rawMsg);
-  if (parsed.intent === "MENU")   return false;
-  if (parsed.intent === "CANCEL") return false;
-
+  if (parsed.intent === "MENU" || parsed.intent === "CANCEL") return false;
   const nluEligibleSteps = [undefined, "MAIN_MENU", "ASK_ROUTE", "ASK_DATE", "SELECT_PARK", "SELECT_TRIP", "ASK_SEATS"];
   if (!nluEligibleSteps.includes(session.step)) return false;
   if (parsed.intent !== "BOOK" && !parsed.from && !parsed.to && !parsed.date) return false;
-
   let mutated = false;
   if (parsed.from  && !session.from)  { session.from  = parsed.from;  mutated = true; }
   if (parsed.to    && !session.to)    { session.to    = parsed.to;    mutated = true; }
   if (parsed.date  && !session.date)  { session.date  = parsed.date;  mutated = true; }
   if (parsed.seats && !session.seats) { session.seats = parsed.seats; mutated = true; }
-
   if (!mutated) return false;
-
-  if (session.from && session.to && session.date) {
-    session.step = "ASK_DATE";
-  } else if (session.from && session.to) {
-    session.step = "ASK_DATE";
-  } else {
-    session.step = "ASK_ROUTE";
-  }
-
+  session.step = (session.from && session.to) ? "ASK_DATE" : "ASK_ROUTE";
   session._nluApplied = true;
   return true;
 }
 
-/* ══════════════════════════════════════════
-   MAIN WEBHOOK
-══════════════════════════════════════════ */
 router.post("/", async (req, res) => {
   const rawMsg = req.body.Body?.trim() || "";
   const phone  = req.body.From;
   const msg    = rawMsg.toLowerCase();
-
   console.log(`[WhatsApp] ${phone} → "${rawMsg}"`);
 
-  const session  = getSession(phone);
+  const session   = getSession(phone);
   const GREETINGS = ["hi","hello","hey","start","menu","restart","back","0"];
 
   if (GREETINGS.includes(msg) && session.step !== undefined) {
-    clearSession(phone);
-    sessions.set(phone, {});
+    clearSession(phone); sessions.set(phone, {});
   }
 
   try {
     if (!GREETINGS.includes(msg)) applyNLU(rawMsg, session);
 
-    /* ─── INITIAL / MAIN MENU ─── */
     if (!session.step || GREETINGS.includes(msg)) {
       session.step = "MAIN_MENU";
       return twimlReply(res,
@@ -184,54 +130,35 @@ Nigeria's Digital Transport Booking
 3️⃣  Customer support
 
 _Or just say where you're going:_
-_"Lagos to Abuja tomorrow"_`
-      );
+_"Lagos to Abuja tomorrow"_`);
     }
 
-    /* ─── MAIN MENU SELECTION ─── */
     if (session.step === "MAIN_MENU") {
       if (session._nluApplied && session.from && session.to) {
         session.step = "ASK_DATE";
-        // fall through to ASK_DATE handler below
       } else if (msg === "1") {
         session.step = "ASK_ROUTE";
-        return twimlReply(res,
-`🗺️ *Route*
-
-Enter your route:
-*Lagos - Abuja*  or  *"Lagos to Abuja"*`
-        );
+        return twimlReply(res, `🗺️ *Route*\n\nEnter your route:\n*Lagos - Abuja*  or  *"Lagos to Abuja"*`);
       } else if (msg === "2") {
         session.step = "CHECK_BOOKING";
         return twimlReply(res, `🔍 Enter your booking reference:\nExample: *GT-A3K7RX*`);
       } else if (msg === "3") {
         clearSession(phone);
-        return twimlReply(res,
-`📞 *Support*
-• Phone: +234 800 000 0000
-• Email: support@goticket.ng
-• Hours: Mon–Sat, 6am–10pm`
-        );
+        return twimlReply(res, `📞 *Support*\n• Phone: +234 800 000 0000\n• Email: support@goticket.ng\n• Hours: Mon–Sat, 6am–10pm`);
       } else {
         return twimlReply(res, `Reply *1*, *2*, or *3*.\nOr say your route: *"Makurdi to Abuja tomorrow"*`);
       }
     }
 
-    /* ─── CHECK BOOKING ─── */
     if (session.step === "CHECK_BOOKING") {
       const parsed = parseIntent(rawMsg);
       const ref    = (parsed.ref || rawMsg.trim()).toUpperCase();
-
       const booking = await prisma.booking.findFirst({
         where:   { reference: ref },
         include: { trip: { include: { branch: { include: { park: true } } } } }
       });
       clearSession(phone);
-
-      if (!booking) {
-        return twimlReply(res, `❌ No booking for *${ref}*.\nCheck the code and try again.\nType *menu* to go back.`);
-      }
-
+      if (!booking) return twimlReply(res, `❌ No booking for *${ref}*.\nCheck the code and try again.\nType *menu* to go back.`);
       const trip = booking.trip;
       return twimlReply(res,
 `✅ *Booking Found*
@@ -244,55 +171,27 @@ Enter your route:
 ⏰ ${formatTime(trip.departureTime)}
 💺 Seat ${booking.seatNumber}
 💰 ${formatCurrency(trip.price)}
+💳 Payment: ${booking.paymentStatus === "PAID" ? "✅ PAID" : "⏳ Pending"}
 
 Show this at the terminal.
-Type *menu* to go back.`
-      );
+Type *menu* to go back.`);
     }
 
-    /* ─── ASK ROUTE ─── */
     if (session.step === "ASK_ROUTE") {
       if (!session.from || !session.to) {
         const route = parseRoute(rawMsg);
-        if (!route) {
-          return twimlReply(res,
-`⚠️ Couldn't read that route.
-Try: *Lagos - Abuja* or *"Makurdi to Abuja"*`
-          );
-        }
-        session.from = route.from;
-        session.to   = route.to;
+        if (!route) return twimlReply(res, `⚠️ Couldn't read that route.\nTry: *Lagos - Abuja* or *"Makurdi to Abuja"*`);
+        session.from = route.from; session.to = route.to;
       }
-
       session.step = "ASK_DATE";
-
-      if (session.date) {
-        session._skipDatePrompt = true;
-      } else {
-        return twimlReply(res,
-`📅 *Travel Date*
-
-Route: *${session.from} → ${session.to}*
-
-Format: *DD-MM-YYYY*
-Or say *"today"* / *"tomorrow"*`
-        );
-      }
+      if (session.date) { session._skipDatePrompt = true; }
+      else return twimlReply(res, `📅 *Travel Date*\n\nRoute: *${session.from} → ${session.to}*\n\nFormat: *DD-MM-YYYY*\nOr say *"today"* / *"tomorrow"*`);
     }
 
-    /* ─── ASK DATE ─────────────────────────────────────────────────────────
-     * CHANGED: after fetching trips, builds park/price option groups and
-     *          advances to SELECT_PARK instead of SELECT_TRIP.
-     * ─────────────────────────────────────────────────────────────────────*/
     if (session.step === "ASK_DATE") {
       if (!session._skipDatePrompt) {
-        const nlpDate = resolveDate(rawMsg);
-        const date    = nlpDate || parseDate(rawMsg);
-        if (!date) {
-          return twimlReply(res,
-`⚠️ Invalid date. Use *DD-MM-YYYY* or say *"today"* / *"tomorrow"*.`
-          );
-        }
+        const date = resolveDate(rawMsg) || parseDate(rawMsg);
+        if (!date) return twimlReply(res, `⚠️ Invalid date. Use *DD-MM-YYYY* or say *"today"* / *"tomorrow"*.`);
         session.date = date;
       }
       session._skipDatePrompt = false;
@@ -307,178 +206,99 @@ Or say *"today"* / *"tomorrow"*`
           destination:   { equals: session.to,   mode: "insensitive" },
           departureTime: { gte: start, lte: end },
         },
-        include: {
-          bookings: true,
-          branch:   { include: { park: true } },
-        },
+        include: { bookings: true, branch: { include: { park: true } } },
         orderBy: { departureTime: "asc" },
       });
 
       const available = trips.filter(t => (t.bookings?.length || 0) < t.totalSeats);
-
       if (!available.length) {
         clearSession(phone);
-        return twimlReply(res,
-`😔 No seats available for:
-📍 ${session.from} → ${session.to}
-📅 ${formatDate(date)}
-
-Type *menu* to try another date.`
-        );
+        return twimlReply(res, `😔 No seats available for:\n📍 ${session.from} → ${session.to}\n📅 ${formatDate(date)}\n\nType *menu* to try another date.`);
       }
 
-      // ── Build park/price groups ──────────────────────────────────────────
       const parkOptions = buildParkOptions(available);
-      session.trips       = available;      // keep full list for later filtering
-      session.parkOptions = parkOptions;    // grouped summary
+      session.trips       = available;
+      session.parkOptions = parkOptions;
       session.step        = "SELECT_PARK";
 
-      // If NLU found only one option, auto-select it
       if (parkOptions.length === 1 && session._nluApplied) {
         session._nluApplied = false;
         return handleParkSelection(res, session, 0);
       }
 
-      // Build the summary message — park name + price only, one line each
-      let msg2 = `🚌 *Available Options*\n`;
-      msg2    += `📍 ${session.from} → ${session.to}\n`;
-      msg2    += `📅 ${formatDate(date)}\n\n`;
-
-      parkOptions.forEach((opt, i) => {
-        msg2 += `*${i + 1}.* ${opt.label}\n`;
-      });
-
+      let msg2 = `🚌 *Available Options*\n📍 ${session.from} → ${session.to}\n📅 ${formatDate(date)}\n\n`;
+      parkOptions.forEach((opt, i) => { msg2 += `*${i + 1}.* ${opt.label}\n`; });
       msg2 += `\nReply with a number.`;
       return twimlReply(res, msg2);
     }
 
-    /* ─── SELECT PARK  (NEW STEP) ───────────────────────────────────────────
-     * User has picked a park+price option.
-     * If that option has multiple trips (different times) → go to SELECT_TRIP.
-     * If only one trip → skip straight to ASK_SEATS.
-     * ─────────────────────────────────────────────────────────────────────*/
     if (session.step === "SELECT_PARK") {
       const index = parseInt(rawMsg) - 1;
       const opts  = session.parkOptions;
-
       if (isNaN(index) || index < 0 || index >= opts?.length) {
-        return twimlReply(res,
-`⚠️ Please reply with a number between 1 and ${opts?.length || "?"}.`
-        );
+        return twimlReply(res, `⚠️ Please reply with a number between 1 and ${opts?.length || "?"}.`);
       }
-
       return handleParkSelection(res, session, index);
     }
 
-    /* ─── SELECT TRIP  (UPDATED) ────────────────────────────────────────────
-     * Now only shows departure times — park and price are already known.
-     * ─────────────────────────────────────────────────────────────────────*/
     if (session.step === "SELECT_TRIP") {
       const index = parseInt(rawMsg) - 1;
       const trip  = session.filteredTrips?.[index];
+      if (!trip) return twimlReply(res, `⚠️ Invalid choice. Reply with a number between 1 and ${session.filteredTrips?.length || "?"}.`);
 
-      if (!trip) {
-        return twimlReply(res,
-`⚠️ Invalid choice. Reply with a number between 1 and ${session.filteredTrips?.length || "?"}.`
-        );
-      }
-
-      // Re-check availability (race condition guard)
       const freshTrip = await prisma.trip.findUnique({
-        where:   { id: trip.id },
-        include: { bookings: true, branch: { include: { park: true } } },
+        where: { id: trip.id }, include: { bookings: true, branch: { include: { park: true } } },
       });
-
       const booked = freshTrip.bookings?.length || 0;
-      if (booked >= freshTrip.totalSeats) {
-        return twimlReply(res,
-`😔 That trip just filled up.
-
-Reply with another number or type *menu* to search again.`
-        );
-      }
+      if (booked >= freshTrip.totalSeats) return twimlReply(res, `😔 That trip just filled up.\n\nReply with another number or type *menu* to search again.`);
 
       session.selectedTrip = freshTrip;
       session.step         = "ASK_SEATS";
-
       const remaining = freshTrip.totalSeats - booked;
-      return twimlReply(res,
-`✅ *Trip Confirmed*
-⏰ ${formatTime(freshTrip.departureTime)}
-💺 ${remaining} seat${remaining !== 1 ? "s" : ""} left
-
-How many seats? (max ${Math.min(remaining, 4)})`
-      );
+      return twimlReply(res, `✅ *Trip Confirmed*\n⏰ ${formatTime(freshTrip.departureTime)}\n💺 ${remaining} seat${remaining !== 1 ? "s" : ""} left\n\nHow many seats? (max ${Math.min(remaining, 4)})`);
     }
 
-    /* ─── ASK SEATS ─── */
     if (session.step === "ASK_SEATS") {
       let seats = session.seats || parseInt(rawMsg);
       const trip = session.selectedTrip;
-
       const freshBookings = await prisma.booking.count({ where: { tripId: trip.id } });
       const remaining     = trip.totalSeats - freshBookings;
-
       if (!seats || seats < 1 || seats > remaining || seats > 4) {
         session.seats = null;
-        return twimlReply(res,
-`⚠️ Enter a valid seat count.
-Available: ${remaining} | Max per booking: ${Math.min(remaining, 4)}`
-        );
+        return twimlReply(res, `⚠️ Enter a valid seat count.\nAvailable: ${remaining} | Max per booking: ${Math.min(remaining, 4)}`);
       }
-
       session.seats = seats;
       session.step  = "ASK_NAME";
-      return twimlReply(res,
-`👤 *Passenger Name*
-
-${seats > 1 ? `Booking ${seats} seats.\n\n` : ""}Enter the lead passenger's full name:`
-      );
+      return twimlReply(res, `👤 *Passenger Name*\n\n${seats > 1 ? `Booking ${seats} seats.\n\n` : ""}Enter the lead passenger's full name:`);
     }
 
-    /* ─── ASK NAME ─── */
     if (session.step === "ASK_NAME") {
       const name = rawMsg.trim();
-      if (name.length < 3 || !/^[a-zA-Z\s\-']+$/.test(name)) {
-        return twimlReply(res, `⚠️ Enter a valid full name.\nExample: *Emeka Okafor*`);
-      }
+      if (name.length < 3 || !/^[a-zA-Z\s\-']+$/.test(name)) return twimlReply(res, `⚠️ Enter a valid full name.\nExample: *Emeka Okafor*`);
       session.passengerName = name;
       session.step          = "ASK_PHONE";
       return twimlReply(res, `📱 Enter the passenger's phone number:\nExample: *08012345678*`);
     }
 
-    /* ─── ASK PHONE ─── */
     if (session.step === "ASK_PHONE") {
       const enteredPhone = rawMsg.trim();
-      if (!isValidPhone(enteredPhone)) {
-        return twimlReply(res, `⚠️ Invalid phone number.\nExample: *08012345678*`);
-      }
+      if (!isValidPhone(enteredPhone)) return twimlReply(res, `⚠️ Invalid phone number.\nExample: *08012345678*`);
       session.passengerPhone = enteredPhone;
       session.step           = "ASK_NOK_NAME";
-      return twimlReply(res,
-`🆘 *Next of Kin*
-
-Enter the next of kin's full name:`
-      );
+      return twimlReply(res, `🆘 *Next of Kin*\n\nEnter the next of kin's full name:`);
     }
 
-    /* ─── ASK NOK NAME ─── */
     if (session.step === "ASK_NOK_NAME") {
       const nokName = rawMsg.trim();
-      if (nokName.length < 3 || !/^[a-zA-Z\s\-']+$/.test(nokName)) {
-        return twimlReply(res, `⚠️ Enter a valid full name for next of kin.\nExample: *Ngozi Okafor*`);
-      }
+      if (nokName.length < 3 || !/^[a-zA-Z\s\-']+$/.test(nokName)) return twimlReply(res, `⚠️ Enter a valid full name for next of kin.\nExample: *Ngozi Okafor*`);
       session.nextOfKinName = nokName;
       session.step          = "ASK_NOK_PHONE";
       return twimlReply(res, `📱 Next of kin's phone number:\nExample: *08087654321*`);
     }
 
-    /* ─── ASK NOK PHONE ─── */
     if (session.step === "ASK_NOK_PHONE") {
       const nokPhone = rawMsg.trim();
-      if (!isValidPhone(nokPhone)) {
-        return twimlReply(res, `⚠️ Invalid phone number.\nExample: *08087654321*`);
-      }
+      if (!isValidPhone(nokPhone)) return twimlReply(res, `⚠️ Invalid phone number.\nExample: *08087654321*`);
       session.nextOfKinPhone = nokPhone;
       session.step           = "CONFIRM";
 
@@ -498,11 +318,17 @@ Enter the next of kin's full name:`
 💺 ${session.seats} seat${session.seats > 1 ? "s" : ""}
 💰 ${formatCurrency(totalAmount)} _(incl. 3% fee)_
 
-Reply *YES* to confirm or *NO* to cancel.`
-      );
+⏰ Payment must be made within *10 minutes* or seat will be released.
+
+Reply *YES* to confirm or *NO* to cancel.`);
     }
 
-    /* ─── CONFIRM ─── */
+    /* ─── CONFIRM ──────────────────────────────────────────────────────────
+     * CHANGED:
+     *   - bookings now store expiresAt (10 min from now)
+     *   - Payment record created alongside each booking
+     *   - createVirtualAccount no longer needs branchSubAccountCode
+     * ─────────────────────────────────────────────────────────────────────*/
     if (session.step === "CONFIRM") {
       if (msg === "no" || msg === "cancel") {
         clearSession(phone);
@@ -523,60 +349,74 @@ Reply *YES* to confirm or *NO* to cancel.`
       const ticketTotal = trip.price * session.seats;
       const { totalAmount } = calculateAmounts(ticketTotal);
 
-      const refs      = [];
+      // Seat lock expiry — 10 minutes from now
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+      const refs       = [];
       const bookingIds = [];
+      const primaryRef = `GT-${Date.now()}-${Math.random().toString(36).slice(2,7).toUpperCase()}`;
 
       for (let i = 0; i < session.seats; i++) {
-        const ref     = generateRef();
+        const ref      = generateRef();
         const nextSeat = freshBookings + i + 1;
         refs.push(ref);
 
         const created = await prisma.booking.create({
           data: {
-            passengerName:  session.passengerName,
-            passengerPhone: session.passengerPhone,
-            seatNumber:     nextSeat,
-            reference:      ref,
-            bookingSource:  "WHATSAPP",
-            tripId:         trip.id,
-            branchId:       trip.branchId,
-            paymentStatus:  "PENDING",
+            passengerName:    session.passengerName,
+            passengerPhone:   session.passengerPhone,
+            seatNumber:       nextSeat,
+            reference:        ref,
+            bookingSource:    "WHATSAPP",
+            tripId:           trip.id,
+            branchId:         trip.branchId,
+            paymentStatus:    "PENDING",
+            status:           "PENDING",
+            paymentMethod:    "ONLINE",
             totalAmount,
-            nextOfKinName:  session.nextOfKinName,
-            nextOfKinPhone: session.nextOfKinPhone,
+            expiresAt,                      // ← NEW: seat lock expiry
+            paymentReference: primaryRef,   // all seats share one Monnify reference
+            nextOfKinName:    session.nextOfKinName,
+            nextOfKinPhone:   session.nextOfKinPhone,
           }
         });
         bookingIds.push(created.id);
+
+        // ── Create Payment record ──────────────────────────────────────────
+        await prisma.payment.create({
+          data: {
+            bookingId:  created.id,
+            provider:   "MONNIFY",
+            amount:     totalAmount,
+            status:     "PENDING",
+          }
+        });
       }
 
-      const primaryRef = refs[0];
+      // ── Request Monnify virtual account ───────────────────────────────────
       let accountNumber, bankName, paymentReference;
 
       try {
-        const tripWithBranch = await prisma.trip.findUnique({
-          where:   { id: trip.id },
-          include: { branch: true },
-        });
-
         const result = await createVirtualAccount({
-          reference:            primaryRef,
-          passengerName:        session.passengerName,
-          passengerPhone:       session.passengerPhone,
-          ticketPrice:          ticketTotal,
-          branchSubAccountCode: tripWithBranch.branch.monnifySubAccountCode,
-          description: `GoTicket: ${session.from} → ${session.to} (${session.seats} seat${session.seats > 1 ? "s" : ""})`,
+          reference:     primaryRef,
+          passengerName: session.passengerName,
+          passengerPhone:session.passengerPhone,
+          ticketPrice:   ticketTotal,
+          description:   `GoTicket: ${session.from} → ${session.to} (${session.seats} seat${session.seats > 1 ? "s" : ""})`,
         });
 
         accountNumber    = result.accountNumber;
         bankName         = result.bankName;
         paymentReference = result.paymentReference;
 
+        // Save account details to all bookings in this group
         await prisma.booking.updateMany({
           where: { id: { in: bookingIds } },
           data:  { accountNumber, bankName, paymentReference },
         });
+
       } catch (monnifyErr) {
-        console.error("[Monnify] Failed:", monnifyErr.message);
+        console.error("[Monnify] Virtual account creation failed:", monnifyErr.message);
         clearSession(phone);
 
         const refList = refs.map((r, i) =>
@@ -584,15 +424,17 @@ Reply *YES* to confirm or *NO* to cancel.`
         ).join("\n");
 
         return twimlReply(res,
-`⚠️ *Booking Created — Payment Pending*
+`⚠️ *Booking Created — Payment Setup Delayed*
 
+Your seat${session.seats > 1 ? "s have" : " has"} been reserved but we couldn't generate your payment account right now.
+
+🎟️ Reference${refs.length > 1 ? "s" : ""}:
 ${refList}
 
-Contact support to pay:
+Please contact support:
 📞 +234 800 000 0000
 
-Type *menu* to go back.`
-        );
+Type *menu* to return.`);
       }
 
       clearSession(phone);
@@ -614,26 +456,21 @@ Type *menu* to go back.`
 ⏰ ${formatTime(trip.departureTime)}
 💺 ${session.seats} seat${session.seats > 1 ? "s" : ""}
 
-💳 *Pay to confirm your seat*
-🏦 ${bankName}
-🔢 *${accountNumber}*
-💰 *${formatCurrency(totalAmount)}*
-🔖 ${paymentReference}
+💳 *Pay Now to Confirm Your Seat*
+━━━━━━━━━━━━━━━━
+🏦 Bank:    ${bankName}
+🔢 Account: *${accountNumber}*
+💰 Amount:  *${formatCurrency(totalAmount)}*
+━━━━━━━━━━━━━━━━
 
-Transfer the exact amount shown.
-Seat confirmed automatically on receipt.
+⚠️ Transfer the *exact amount* shown.
+⏰ Payment expires in *10 minutes*.
+Your seat is confirmed automatically on receipt.
 
-Type *menu* for a new booking.`
-      );
+Type *menu* for a new booking.`);
     }
 
-    // Fallback
-    return twimlReply(res,
-`I didn't understand that.
-
-Type *menu* or say your route:
-*"Lagos to Abuja tomorrow"*`
-    );
+    return twimlReply(res, `I didn't understand that.\n\nType *menu* or say your route:\n*"Lagos to Abuja tomorrow"*`);
 
   } catch (error) {
     console.error("[WhatsApp Bot Error]", error);
@@ -642,70 +479,43 @@ Type *menu* or say your route:
   }
 });
 
-/* ══════════════════════════════════════════
-   PARK SELECTION HANDLER
-   ──────────────────────────────────────────
-   Extracted as a named function so both
-   SELECT_PARK and the NLU auto-select path
-   use identical logic with no duplication.
-══════════════════════════════════════════ */
+/* ── Park selection handler (unchanged) ─────────────────────────────────── */
 async function handleParkSelection(res, session, optionIndex) {
   const chosen = session.parkOptions[optionIndex];
-
-  // Re-check seat availability for all trips in this group
   const freshTrips = await Promise.all(
-    chosen.trips.map(t =>
-      prisma.trip.findUnique({
-        where:   { id: t.id },
-        include: { bookings: true, branch: { include: { park: true } } },
-      })
-    )
+    chosen.trips.map(t => prisma.trip.findUnique({
+      where: { id: t.id }, include: { bookings: true, branch: { include: { park: true } } },
+    }))
   );
-
-  const stillAvailable = freshTrips.filter(
-    t => (t.bookings?.length || 0) < t.totalSeats
-  );
+  const stillAvailable = freshTrips.filter(t => (t.bookings?.length || 0) < t.totalSeats);
 
   if (!stillAvailable.length) {
-    return twimlReply(res,
-`😔 All trips for *${chosen.park}* just filled up.
-
-Type *menu* to search again.`
-    );
+    return twimlReply(res, `😔 All trips for *${chosen.park}* just filled up.\n\nType *menu* to search again.`);
   }
 
-  // Only one trip at this park+price — skip the time-selection step
   if (stillAvailable.length === 1) {
     const trip      = stillAvailable[0];
     const booked    = trip.bookings?.length || 0;
     const remaining = trip.totalSeats - booked;
-
     session.selectedTrip = trip;
     session.step         = "ASK_SEATS";
-
     return twimlReply(res,
 `✅ *${chosen.park}*
 💰 ${formatCurrency(chosen.price)}
 ⏰ ${formatTime(trip.departureTime)}
 💺 ${remaining} seat${remaining !== 1 ? "s" : ""} left
 
-How many seats? (max ${Math.min(remaining, 4)})`
-    );
+How many seats? (max ${Math.min(remaining, 4)})`);
   }
 
-  // Multiple departure times — let user pick one
   session.filteredTrips = stillAvailable;
   session.step          = "SELECT_TRIP";
 
-  let msg = `🕐 *${chosen.park}* — ${formatCurrency(chosen.price)}\n`;
-  msg    += `Choose a departure time:\n\n`;
-
+  let msg = `🕐 *${chosen.park}* — ${formatCurrency(chosen.price)}\nChoose a departure time:\n\n`;
   stillAvailable.forEach((t, i) => {
-    const booked    = t.bookings?.length || 0;
-    const remaining = t.totalSeats - booked;
+    const remaining = t.totalSeats - (t.bookings?.length || 0);
     msg += `*${i + 1}.* ${formatTime(t.departureTime)} — ${remaining} seat${remaining !== 1 ? "s" : ""} left\n`;
   });
-
   return twimlReply(res, msg);
 }
 
