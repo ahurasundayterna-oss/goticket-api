@@ -1,16 +1,10 @@
-// routes/bookings.js
-//
-// Changes from previous version:
-//   1. POST /manual now accepts + validates nextOfKinName, nextOfKinPhone (required)
-//   2. GET  /:tripId/manifest  — passenger list sorted by seat, auth required
-//   3. GET  /:tripId/manifest/print — plain-text formatted manifest, auth required
-//
-// All other routes (GET /, POST /:id/cancel, DELETE /:id) are byte-for-byte identical.
+"use strict";
 
 const express = require("express");
 const router  = express.Router();
 const prisma  = require("../prismaClient");
 const auth    = require("../middleware/auth");
+const { checkAndDeductWallet } = require("../services/wallet");
 const { requireBranchAdmin, requireBranchMember } = require("../middleware/role");
 const { lockSeat, releaseLock, nextAvailableSeat, cleanExpiredLocks } = require("../services/seatLock");
 
@@ -22,7 +16,7 @@ function generateRef() {
 }
 
 /* ══════════════════════════════════════════════
-   GET /api/bookings  — unchanged
+   GET /api/bookings
 ══════════════════════════════════════════════ */
 router.get("/", auth, requireBranchMember, async (req, res) => {
   try {
@@ -34,21 +28,15 @@ router.get("/", auth, requireBranchMember, async (req, res) => {
     if (source) where.bookingSource = source;
 
     if (date) {
-  const start = new Date(date + "T00:00:00");
-  const end   = new Date(date + "T23:59:59");
-
-  where.trip = {
-    OR: [
-      {
-        tripType: "SCHEDULED",
-        departureTime: { gte: start, lte: end }
-      },
-      {
-        tripType: "FLEXIBLE"
-      }
-    ]
-  };
-}
+      const start = new Date(date + "T00:00:00");
+      const end   = new Date(date + "T23:59:59");
+      where.trip = {
+        OR: [
+          { tripType: "SCHEDULED", departureTime: { gte: start, lte: end } },
+          { tripType: "FLEXIBLE" },
+        ],
+      };
+    }
 
     if (role === "STAFF") {
       if (!assignedRouteIds?.length) return res.json([]);
@@ -59,9 +47,9 @@ router.get("/", auth, requireBranchMember, async (req, res) => {
       where,
       include: {
         trip:      true,
-        createdBy: { select: { id:true, name:true, role:true } }
+        createdBy: { select: { id: true, name: true, role: true } },
       },
-      orderBy: { createdAt: "desc" }
+      orderBy: { createdAt: "desc" },
     });
 
     res.json(bookings);
@@ -73,25 +61,31 @@ router.get("/", auth, requireBranchMember, async (req, res) => {
 
 /* ══════════════════════════════════════════════
    POST /api/bookings/manual
-   CHANGED: now requires nextOfKinName + nextOfKinPhone
+   ──────────────────────────────────────────────
+   FIXED: manual bookings are now immediately PAID
+   (cash collected at terminal on booking creation)
+══════════════════════════════════════════════ */
+
+/* ══════════════════════════════════════════════
+   POST /api/bookings/manual
+   ──────────────────────────────────────────────
+   UPDATED: wallet deduction inside transaction
 ══════════════════════════════════════════════ */
 router.post("/manual", auth, requireBranchMember, async (req, res) => {
   const {
     tripId, passengerName, passengerPhone, seatNumber,
-    nextOfKinName, nextOfKinPhone,            // ← NEW
+    nextOfKinName, nextOfKinPhone,
   } = req.body;
   const { branchId, role, assignedRouteIds, id: userId } = req.user;
 
-  // ── Validation ────────────────────────────────────────────────────────────
+  // ── Validation ────────────────────────────────────────────────
   if (!tripId || !passengerName || !passengerPhone) {
     return res.status(400).json({ message: "tripId, passengerName and passengerPhone required" });
   }
-
-  // Next of kin — required for manual bookings
-  if (!nextOfKinName || !nextOfKinName.trim()) {
+  if (!nextOfKinName?.trim()) {
     return res.status(400).json({ message: "nextOfKinName is required" });
   }
-  if (!nextOfKinPhone || !nextOfKinPhone.trim()) {
+  if (!nextOfKinPhone?.trim()) {
     return res.status(400).json({ message: "nextOfKinPhone is required" });
   }
   if (!/^\+?[0-9]{7,15}$/.test(nextOfKinPhone.replace(/\s/g, ""))) {
@@ -100,7 +94,7 @@ router.post("/manual", auth, requireBranchMember, async (req, res) => {
 
   const trip = await prisma.trip.findFirst({
     where:   { id: tripId, branchId },
-    include: { bookings: { where: { status:"CONFIRMED" }, select: { seatNumber:true } } }
+    include: { bookings: { where: { status: "CONFIRMED" }, select: { seatNumber: true } } },
   });
 
   if (!trip)                  return res.status(404).json({ message: "Trip not found" });
@@ -130,24 +124,38 @@ router.post("/manual", auth, requireBranchMember, async (req, res) => {
   if (!lockResult.success) return res.status(409).json({ message: lockResult.message });
 
   try {
+    const reference = generateRef();
+
     const result = await prisma.$transaction(async (tx) => {
+
+      // ── 1. Wallet check + deduction (atomic) ──────────────────
+      await checkAndDeductWallet(tx, branchId, reference);
+
+      // ── 2. Create booking ─────────────────────────────────────
       const booking = await tx.booking.create({
         data: {
-          tripId, branchId, passengerName, passengerPhone,
-          seatNumber:    targetSeat,
-          reference:     generateRef(),
-          bookingSource: "MANUAL",
-          status:        "CONFIRMED",
-          createdById:   userId,
-          // ── NEW ──────────────────────────────────────────────────────────
+          tripId,
+          branchId,
+          passengerName,
+          passengerPhone,
+          seatNumber:     targetSeat,
+          reference,
+          bookingSource:  "MANUAL",
+          status:         "CONFIRMED",
+          createdById:    userId,
           nextOfKinName:  nextOfKinName.trim(),
           nextOfKinPhone: nextOfKinPhone.trim(),
-        }
+          paymentStatus:  "PAID",
+          paymentMethod:  "CASH",
+          paidAt:         new Date(),
+          totalAmount:    trip.price,
+        },
       });
 
+      // ── 3. Update seat count ──────────────────────────────────
       const updatedTrip = await tx.trip.update({
         where: { id: tripId },
-        data:  { seatsBooked: { increment: 1 } }
+        data:  { seatsBooked: { increment: 1 } },
       });
 
       const threshold = updatedTrip.fillThreshold ?? updatedTrip.totalSeats;
@@ -161,26 +169,97 @@ router.post("/manual", auth, requireBranchMember, async (req, res) => {
     await releaseLock(tripId, targetSeat);
 
     const full = await prisma.booking.findUnique({
-      where: { id: result.id }, include: { trip: true }
+      where:   { id: result.id },
+      include: { trip: true },
     });
 
     return res.status(201).json(full);
+
   } catch (err) {
     await releaseLock(tripId, targetSeat);
+
+    // ── Surface wallet errors clearly to the frontend ────────────
+    if (err.message.includes("Insufficient wallet")) {
+      return res.status(402).json({
+        message: err.message,
+        code:    "WALLET_EXHAUSTED",
+      });
+    }
+
     console.error("MANUAL BOOKING ERROR:", err);
     return res.status(500).json({ message: "Error creating booking" });
   }
 });
 
 /* ══════════════════════════════════════════════
-   POST /api/bookings/:id/cancel — unchanged
+   PATCH /api/bookings/:id/confirm-payment
+   ──────────────────────────────────────────────
+   For WhatsApp bookings that start as PENDING.
+   Manual bookings are already PAID on creation
+   so this is only needed for WHATSAPP/ONLINE.
+══════════════════════════════════════════════ */
+router.patch("/:id/confirm-payment", auth, requireBranchMember, async (req, res) => {
+  try {
+    const { role, id: userId, branchId } = req.user;
+    const { paymentMethod = "CASH" } = req.body;
+
+    const VALID_METHODS = ["CASH", "TRANSFER", "ONLINE"];
+    if (!VALID_METHODS.includes(paymentMethod)) {
+      return res.status(400).json({
+        message: `paymentMethod must be one of: ${VALID_METHODS.join(", ")}`,
+      });
+    }
+
+    const booking = await prisma.booking.findFirst({
+      where: { id: req.params.id, branchId },
+      include: { trip: { select: { price: true } } },
+    });
+
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+    if (booking.paymentStatus === "PAID") {
+      return res.status(400).json({ message: "Booking is already confirmed as paid" });
+    }
+    if (booking.status === "CANCELLED") {
+      return res.status(400).json({ message: "Cannot confirm payment for a cancelled booking" });
+    }
+    if (role === "STAFF" && booking.createdById !== userId) {
+      return res.status(403).json({ message: "You can only confirm payment for bookings you created" });
+    }
+
+    const updated = await prisma.booking.update({
+      where: { id: booking.id },
+      data: {
+        paymentStatus: "PAID",
+        status:        "CONFIRMED",
+        paidAt:        new Date(),
+        paymentMethod,
+        // ── Ensure totalAmount is set if missing ──────────────────
+        totalAmount:   booking.totalAmount || booking.trip?.price || 0,
+      },
+      include: {
+        trip:      true,
+        createdBy: { select: { id: true, name: true } },
+      },
+    });
+
+    return res.json({ message: "Payment confirmed successfully", booking: updated });
+  } catch (err) {
+    console.error("CONFIRM PAYMENT ERROR:", err);
+    return res.status(500).json({ message: "Error confirming payment" });
+  }
+});
+
+/* ══════════════════════════════════════════════
+   POST /api/bookings/:id/cancel
 ══════════════════════════════════════════════ */
 router.post("/:id/cancel", auth, requireBranchMember, async (req, res) => {
   try {
     const { role, id: userId, branchId } = req.user;
 
     const booking = await prisma.booking.findFirst({
-      where: { id: req.params.id, branchId }
+      where: { id: req.params.id, branchId },
     });
     if (!booking) return res.status(404).json({ message: "Booking not found" });
 
@@ -192,9 +271,13 @@ router.post("/:id/cancel", auth, requireBranchMember, async (req, res) => {
     }
 
     await prisma.$transaction(async (tx) => {
-      await tx.booking.update({ where: { id: booking.id }, data: { status: "CANCELLED" } });
+      await tx.booking.update({
+        where: { id: booking.id },
+        data:  { status: "CANCELLED" },
+      });
       const updatedTrip = await tx.trip.update({
-        where: { id: booking.tripId }, data: { seatsBooked: { decrement: 1 } }
+        where: { id: booking.tripId },
+        data:  { seatsBooked: { decrement: 1 } },
       });
       if (updatedTrip.status === "FULL") {
         await tx.trip.update({ where: { id: booking.tripId }, data: { status: "OPEN" } });
@@ -209,12 +292,12 @@ router.post("/:id/cancel", auth, requireBranchMember, async (req, res) => {
 });
 
 /* ══════════════════════════════════════════════
-   DELETE /api/bookings/:id — unchanged
+   DELETE /api/bookings/:id
 ══════════════════════════════════════════════ */
 router.delete("/:id", auth, requireBranchAdmin, async (req, res) => {
   try {
     const booking = await prisma.booking.findFirst({
-      where: { id: req.params.id, branchId: req.user.branchId }
+      where: { id: req.params.id, branchId: req.user.branchId },
     });
     if (!booking) return res.status(404).json({ message: "Booking not found" });
 
@@ -222,7 +305,8 @@ router.delete("/:id", auth, requireBranchAdmin, async (req, res) => {
       await tx.booking.delete({ where: { id: booking.id } });
       if (booking.status === "CONFIRMED") {
         await tx.trip.update({
-          where: { id: booking.tripId }, data: { seatsBooked: { decrement: 1 } }
+          where: { id: booking.tripId },
+          data:  { seatsBooked: { decrement: 1 } },
         });
       }
     });
@@ -236,36 +320,26 @@ router.delete("/:id", auth, requireBranchAdmin, async (req, res) => {
 
 /* ══════════════════════════════════════════════
    GET /api/bookings/:tripId/manifest
-   NEW — passenger manifest for a trip.
-   Auth required. Branch members only (same branchId check).
-   Returns bookings sorted by seatNumber ascending.
 ══════════════════════════════════════════════ */
 router.get("/:tripId/manifest", auth, requireBranchMember, async (req, res) => {
   try {
     const { tripId } = req.params;
     const { branchId } = req.user;
 
-    // Verify trip belongs to this branch
     const trip = await prisma.trip.findFirst({
       where:   { id: tripId, branchId },
-      include: { branch: { include: { park: true } } }
+      include: { branch: { include: { park: true } } },
     });
-
     if (!trip) return res.status(404).json({ message: "Trip not found" });
 
     const bookings = await prisma.booking.findMany({
       where:   { tripId, status: { not: "CANCELLED" } },
       select: {
-        seatNumber:     true,
-        passengerName:  true,
-        passengerPhone: true,
-        nextOfKinName:  true,
-        nextOfKinPhone: true,
-        paymentStatus:  true,
-        reference:      true,
-        bookingSource:  true,
+        seatNumber: true, passengerName: true, passengerPhone: true,
+        nextOfKinName: true, nextOfKinPhone: true,
+        paymentStatus: true, reference: true, bookingSource: true,
       },
-      orderBy: { seatNumber: "asc" }
+      orderBy: { seatNumber: "asc" },
     });
 
     return res.json({
@@ -289,9 +363,6 @@ router.get("/:tripId/manifest", auth, requireBranchMember, async (req, res) => {
 
 /* ══════════════════════════════════════════════
    GET /api/bookings/:tripId/manifest/print
-   NEW — plain-text printable manifest.
-   Returns Content-Type: text/plain so it can be
-   opened directly or piped to a printer.
 ══════════════════════════════════════════════ */
 router.get("/:tripId/manifest/print", auth, requireBranchMember, async (req, res) => {
   try {
@@ -300,40 +371,31 @@ router.get("/:tripId/manifest/print", auth, requireBranchMember, async (req, res
 
     const trip = await prisma.trip.findFirst({
       where:   { id: tripId, branchId },
-      include: { branch: { include: { park: true } } }
+      include: { branch: { include: { park: true } } },
     });
-
     if (!trip) return res.status(404).json({ message: "Trip not found" });
 
     const bookings = await prisma.booking.findMany({
       where:   { tripId, status: { not: "CANCELLED" } },
       select: {
-        seatNumber:     true,
-        passengerName:  true,
-        passengerPhone: true,
-        nextOfKinName:  true,
-        nextOfKinPhone: true,
-        paymentStatus:  true,
-        reference:      true,
-        bookingSource:  true,
+        seatNumber: true, passengerName: true, passengerPhone: true,
+        nextOfKinName: true, nextOfKinPhone: true,
+        paymentStatus: true, reference: true, bookingSource: true,
       },
-      orderBy: { seatNumber: "asc" }
+      orderBy: { seatNumber: "asc" },
     });
 
-    // ── Format helpers ────────────────────────────────────────────────────
     const pad  = (str, len) => String(str ?? "").padEnd(len);
     const line = (char = "─", len = 72) => char.repeat(len);
 
     const departureDate = new Date(trip.departureTime).toLocaleDateString("en-NG", {
-      weekday: "long", day: "numeric", month: "long", year: "numeric"
+      weekday: "long", day: "numeric", month: "long", year: "numeric",
     });
     const departureTime = new Date(trip.departureTime).toLocaleTimeString("en-NG", {
-      hour: "2-digit", minute: "2-digit"
+      hour: "2-digit", minute: "2-digit",
     });
 
-    // ── Build manifest text ───────────────────────────────────────────────
     const rows = [];
-
     rows.push(line("═"));
     rows.push("  GOTICKET — PASSENGER MANIFEST");
     rows.push(line("═"));
@@ -346,16 +408,9 @@ router.get("/:tripId/manifest/print", auth, requireBranchMember, async (req, res
     rows.push(`  Printed:    ${new Date().toLocaleString("en-NG")}`);
     rows.push(line("─"));
     rows.push("");
-
-    // Column headers
     rows.push(
-      `${pad("#",    4)}` +
-      `${pad("NAME",          22)}` +
-      `${pad("PHONE",         16)}` +
-      `${pad("NEXT OF KIN",   22)}` +
-      `${pad("NOK PHONE",     16)}` +
-      `${pad("PMT",            8)}` +
-      `REF`
+      `${pad("#", 4)}${pad("NAME", 22)}${pad("PHONE", 16)}` +
+      `${pad("NEXT OF KIN", 22)}${pad("NOK PHONE", 16)}${pad("PMT", 8)}REF`
     );
     rows.push(line("─"));
 
@@ -363,18 +418,11 @@ router.get("/:tripId/manifest/print", auth, requireBranchMember, async (req, res
       rows.push("  No passengers booked.");
     } else {
       bookings.forEach(b => {
-        const payStatus = b.paymentStatus
-          ? (b.paymentStatus === "PAID" ? "PAID" : "PEND")
-          : (b.bookingSource === "MANUAL" ? "CASH" : "PEND");
-
+        const payStatus = b.paymentStatus === "PAID" ? "PAID" : "PEND";
         rows.push(
-          `${pad(b.seatNumber,   4)}` +
-          `${pad(b.passengerName,  22)}` +
-          `${pad(b.passengerPhone, 16)}` +
-          `${pad(b.nextOfKinName  || "—", 22)}` +
-          `${pad(b.nextOfKinPhone || "—", 16)}` +
-          `${pad(payStatus,  8)}` +
-          `${b.reference}`
+          `${pad(b.seatNumber, 4)}${pad(b.passengerName, 22)}` +
+          `${pad(b.passengerPhone, 16)}${pad(b.nextOfKinName || "—", 22)}` +
+          `${pad(b.nextOfKinPhone || "—", 16)}${pad(payStatus, 8)}${b.reference}`
         );
       });
     }
@@ -386,128 +434,11 @@ router.get("/:tripId/manifest/print", auth, requireBranchMember, async (req, res
     rows.push("");
 
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.setHeader(
-      "Content-Disposition",
-      `inline; filename="manifest-${tripId}-${Date.now()}.txt"`
-    );
+    res.setHeader("Content-Disposition", `inline; filename="manifest-${tripId}-${Date.now()}.txt"`);
     return res.send(rows.join("\n"));
-
   } catch (err) {
     console.error("MANIFEST PRINT ERROR:", err);
     res.status(500).json({ message: "Error generating manifest" });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ADD THIS ROUTE to your existing routes/bookings.js
-// Place it before the module.exports line.
-//
-// This is the ONLY addition needed to bookings.js.
-// All existing routes (GET, POST /manual, cancel, delete, manifest) are untouched.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/* ══════════════════════════════════════════════
-   PATCH /api/bookings/:id/confirm-payment
-   ──────────────────────────────────────────────
-   Confirms payment for a booking manually.
-   Works for BOTH manual and WhatsApp bookings.
-
-   Body (optional): { paymentMethod: "CASH" | "TRANSFER" | "ONLINE" }
-   Default paymentMethod: "CASH"
-
-   Sets:
-     paymentStatus = "PAID"
-     status        = "CONFIRMED"
-     paidAt        = now()
-     paymentMethod = body.paymentMethod || "CASH"
-
-   ── FUTURE PAYSTACK INTEGRATION ────────────────
-   When Paystack is added, this endpoint stays
-   exactly as-is for manual confirmations.
-
-   You will add a NEW route:
-     POST /api/bookings/paystack/webhook
-   That webhook will:
-     1. Verify Paystack signature
-     2. Extract booking reference from event.data.reference
-     3. Call the same DB update logic below (extract it to a shared fn)
-     4. Set paymentMethod = "ONLINE"
-     5. Set paymentReference = event.data.reference
-
-   The booking.paymentReference field is already in
-   your schema waiting for that reference.
-   ────────────────────────────────────────────────
-
-   Auth: Branch Admin or Staff (requireBranchMember)
-   Staff can only confirm bookings they created.
-   Branch Admin can confirm any booking in their branch.
-══════════════════════════════════════════════ */
-router.patch("/:id/confirm-payment", auth, requireBranchMember, async (req, res) => {
-  try {
-    const { role, id: userId, branchId } = req.user;
-    const { paymentMethod = "CASH" } = req.body;
-
-    // Validate paymentMethod
-    const VALID_METHODS = ["CASH", "TRANSFER", "ONLINE"];
-    if (!VALID_METHODS.includes(paymentMethod)) {
-      return res.status(400).json({
-        message: `paymentMethod must be one of: ${VALID_METHODS.join(", ")}`
-      });
-    }
-
-    // Find booking — scoped to this branch
-    const booking = await prisma.booking.findFirst({
-      where: { id: req.params.id, branchId }
-    });
-
-    if (!booking) {
-      return res.status(404).json({ message: "Booking not found" });
-    }
-
-    // Already paid — do not double-confirm
-    if (booking.paymentStatus === "PAID") {
-      return res.status(400).json({ message: "Booking is already confirmed as paid" });
-    }
-
-    // Cancelled bookings cannot be paid
-    if (booking.status === "CANCELLED") {
-      return res.status(400).json({ message: "Cannot confirm payment for a cancelled booking" });
-    }
-
-    // Staff can only confirm bookings they created
-    if (role === "STAFF" && booking.createdById !== userId) {
-      return res.status(403).json({
-        message: "You can only confirm payment for bookings you created"
-      });
-    }
-
-    // ── Update booking ─────────────────────────────────────────────────────
-    // ── FUTURE PAYSTACK: extract this update into a shared confirmPayment(id, method, reference)
-    // ── function so both this route and the Paystack webhook can call it.
-    const updated = await prisma.booking.update({
-      where: { id: booking.id },
-      data: {
-        paymentStatus: "PAID",
-        status:        "CONFIRMED",
-        paidAt:        new Date(),
-        paymentMethod,
-        // paymentReference is left null here — Paystack webhook will set it later
-        // when ONLINE payments are auto-confirmed via webhook
-      },
-      include: {
-        trip:      true,
-        createdBy: { select: { id: true, name: true } }
-      }
-    });
-
-    return res.json({
-      message:  "Payment confirmed successfully",
-      booking:  updated,
-    });
-
-  } catch (err) {
-    console.error("CONFIRM PAYMENT ERROR:", err);
-    return res.status(500).json({ message: "Error confirming payment" });
   }
 });
 

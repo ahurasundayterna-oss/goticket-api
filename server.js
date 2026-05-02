@@ -9,15 +9,23 @@ const app = express();
 const staffRoutes = require("./routes/staff");
 const paymentsRoutes = require("./routes/payments");
 
-// ─────────────────────────────────────────
-// MONNIFY WEBHOOK (MUST COME FIRST)
-// Raw body route before express.json()
-// ─────────────────────────────────────────
+// ── WEBHOOKS — MUST come before express.json() ──────────────────
 app.use("/api/monnify/webhook", require("./routes/monnifyWebhook"));
 
-// ─────────────────────────────────────────
-// NORMAL MIDDLEWARE
-// ─────────────────────────────────────────
+// Wallet webhook also needs raw body — mount the specific path only
+const walletRouter = require("./routes/wallet");
+app.post(
+  "/api/wallet/webhook",
+  require("express").raw({ type: "application/json" }),
+  (req, res, next) => {
+    // Mark body as already parsed so the wallet route skips raw() again
+    req._rawBodyParsed = true;
+    next();
+  },
+  walletRouter
+);
+
+// ── NORMAL MIDDLEWARE ────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -46,6 +54,8 @@ app.use("/api/super", require("./routes/super/index"));
 app.use("/api/trips", require("./routes/trips"));
 app.use("/api/bookings", require("./routes/bookings"));
 app.use("/api/reports", require("./routes/reports"));
+// Add with your other routes:
+app.use("/api/wallet", require("./routes/wallet"));
 
 // ─────────────────────────────────────────
 // NEW ROUTES

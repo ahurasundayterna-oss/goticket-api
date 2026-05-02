@@ -18,16 +18,45 @@ model Park {
 }
 
 model Branch {
-  id                    String    @id @default(cuid())
+  id                    String  @id @default(cuid())
   name                  String
   parkId                String
-  suspended             Boolean   @default(false)
-  createdAt             DateTime  @default(now())
-  bookings              Booking[]
-  park                  Park      @relation(fields: [parkId], references: [id])
-  routes                Route[]
-  trips                 Trip[]
-  users                 User[]
+  monnifySubAccountCode String?
+  accountNumber         String?
+  bankName              String?
+  accountName           String?
+  suspended             Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+
+  // ── Wallet ──────────────────────────────────────
+  walletBalance Float   @default(0)
+  walletEnabled Boolean @default(true)
+
+  park               Park                @relation(fields: [parkId], references: [id], onDelete: Cascade)
+  users              User[]
+  routes             Route[]
+  trips              Trip[]
+  bookings           Booking[]
+  walletTransactions WalletTransaction[]
+}
+
+model WalletTransaction {
+  id          String   @id @default(cuid())
+  branchId    String
+  amount      Float
+  type        String
+  reference   String?  @unique
+  description String?
+  status      String   @default("SUCCESS")
+  createdAt   DateTime @default(now())
+
+  branch Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@index([branchId])
+  @@index([reference])
+  @@index([createdAt])
 }
 
 model User {
@@ -37,13 +66,13 @@ model User {
   password         String
   role             String                 @default("BRANCH_ADMIN")
   branchId         String?
-  createdAt        DateTime               @default(now())
   suspended        Boolean                @default(false)
+  createdAt        DateTime               @default(now())
   bookingsCreated  Booking[]
   routeAssignments RouteStaffAssignment[]
   seatLocks        SeatLock[]
   Trip             Trip[]
-  branch           Branch?                @relation(fields: [branchId], references: [id])
+  branch           Branch?                @relation(fields: [branchId], references: [id], onDelete: SetNull)
 }
 
 model Route {
@@ -54,7 +83,7 @@ model Route {
   branchId         String
   createdAt        DateTime               @default(now())
   active           Boolean                @default(true)
-  branch           Branch                 @relation(fields: [branchId], references: [id])
+  branch           Branch                 @relation(fields: [branchId], references: [id], onDelete: Cascade)
   staffAssignments RouteStaffAssignment[]
   trips            Trip[]
 
@@ -78,38 +107,38 @@ model Trip {
   seatsBooked   Int        @default(0)
   bookings      Booking[]
   seatLocks     SeatLock[]
-  branch        Branch     @relation(fields: [branchId], references: [id])
+  branch        Branch     @relation(fields: [branchId], references: [id], onDelete: Cascade)
   createdBy     User       @relation(fields: [createdById], references: [id])
-  route         Route      @relation(fields: [routeId], references: [id])
+  route         Route      @relation(fields: [routeId], references: [id], onDelete: Cascade)
 }
 
 model Booking {
-  id                String    @id @default(cuid())
-  passengerName     String
-  passengerPhone    String
-  seatNumber        Int
-  reference         String    @unique
-  bookingSource     String    @default("MANUAL")
-  tripId            String
-  branchId          String
-  createdAt         DateTime  @default(now())
-  createdById       String?
-  accountNumber     String?
-  bankName          String?
-  paidAt            DateTime?
-  paymentReference  String?   // GoTicket ref saved to Monnify accountReference
-  monnifyReference  String?   // Monnify's own transactionReference from webhook
-  paymentStatus     String?   // "PENDING" | "PAID" | "FAILED"
-  paymentMethod     String?   // "CASH" | "TRANSFER" | "ONLINE"
-  totalAmount       Float?
-  nextOfKinName     String?
-  nextOfKinPhone    String?
-  status            String    @default("PENDING")
-  branch            Branch    @relation(fields: [branchId], references: [id])
-  createdBy         User?     @relation(fields: [createdById], references: [id])
-  trip              Trip      @relation(fields: [tripId], references: [id])
-  payment           Payment?
-  expiresAt DateTime?
+  id               String    @id @default(cuid())
+  passengerName    String
+  passengerPhone   String
+  seatNumber       Int
+  reference        String    @unique
+  bookingSource    String    @default("MANUAL")
+  tripId           String
+  branchId         String
+  createdAt        DateTime  @default(now())
+  createdById      String?
+  accountNumber    String?
+  bankName         String?
+  paidAt           DateTime?
+  paymentReference String?
+  monnifyReference String?
+  paymentStatus    String?
+  paymentMethod    String?
+  totalAmount      Float?
+  nextOfKinName    String?
+  nextOfKinPhone   String?
+  status           String    @default("PENDING")
+  branch           Branch    @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  createdBy        User?     @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  trip             Trip      @relation(fields: [tripId], references: [id], onDelete: Cascade)
+  payment          Payment?
+  expiresAt        DateTime?
 
   @@index([paymentReference])
   @@index([monnifyReference])
@@ -134,7 +163,7 @@ model Payment {
 
 model WebhookLog {
   id        String   @id @default(cuid())
-  eventId   String   @unique  // Monnify paymentReference — unique per transaction
+  eventId   String   @unique
   provider  String   @default("MONNIFY")
   event     String
   processed Boolean  @default(false)
@@ -150,8 +179,8 @@ model SeatLock {
   expiresAt  DateTime
   createdAt  DateTime @default(now())
   lockedById String?
-  lockedBy   User?    @relation(fields: [lockedById], references: [id])
-  trip       Trip     @relation(fields: [tripId], references: [id])
+  lockedBy   User?    @relation(fields: [lockedById], references: [id], onDelete: SetNull)
+  trip       Trip     @relation(fields: [tripId], references: [id], onDelete: Cascade)
 }
 
 model RouteStaffAssignment {
@@ -159,8 +188,8 @@ model RouteStaffAssignment {
   routeId   String
   staffId   String
   createdAt DateTime @default(now())
-  route     Route    @relation(fields: [routeId], references: [id])
-  staff     User     @relation(fields: [staffId], references: [id])
+  route     Route    @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  staff     User     @relation(fields: [staffId], references: [id], onDelete: Cascade)
 
   @@unique([routeId, staffId])
 }

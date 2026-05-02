@@ -24,7 +24,6 @@ module.exports = async function auth(req, res, next) {
 
     // ── Suspension check ─────────────────────────────────────────
     const suspension = await checkSuspension(decoded.id);
-
     if (suspension) {
       return res.status(403).json({
         message:   suspension.reason,
@@ -35,35 +34,30 @@ module.exports = async function auth(req, res, next) {
 
     // ── Staff route assignments ──────────────────────────────────
     let assignedRouteIds = [];
-
     if (decoded.role === "STAFF") {
       try {
         const assignments = await prisma.routeStaffAssignment.findMany({
           where:  { staffId: decoded.id },
           select: { routeId: true },
         });
-
         assignedRouteIds = assignments.map(a => a.routeId);
-
-        console.log("ASSIGNED ROUTES:", assignedRouteIds); // 🔍 debug
       } catch (assignErr) {
         console.error("Staff route lookup failed:", assignErr.message);
-        assignedRouteIds = [];
       }
     }
 
-    // ── Attach decoded user to request ───────────────────────────
+    // ── Attach user to request ───────────────────────────────────
     req.user = {
       id:               decoded.id,
       role:             decoded.role,
-      branchId:         decoded.branchId,
-      branchName:       decoded.branchName,
-      parkName:         decoded.parkName,
+      branchId:         decoded.branchId   || null,
+      parkId:           decoded.parkId     || null, // ← Park Admin uses this
+      branchName:       decoded.branchName || null,
+      parkName:         decoded.parkName   || null,
       assignedRouteIds,
     };
 
     next();
-
   } catch (err) {
     console.error("AUTH ERROR:", err.message);
     return res.status(401).json({ message: "Invalid or expired token" });

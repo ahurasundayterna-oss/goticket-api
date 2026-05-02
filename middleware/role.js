@@ -1,5 +1,4 @@
 // middleware/role.js
-// Granular role guards used across all routes.
 
 module.exports.requireSuperAdmin = (req, res, next) => {
   if (req.user?.role !== "SUPER_ADMIN") {
@@ -22,7 +21,6 @@ module.exports.requireStaff = (req, res, next) => {
   next();
 };
 
-// Branch Admin OR Staff (both can access trips/bookings for their branch)
 module.exports.requireBranchMember = (req, res, next) => {
   if (!["BRANCH_ADMIN", "STAFF"].includes(req.user?.role)) {
     return res.status(403).json({ message: "Branch access required." });

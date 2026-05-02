@@ -7,6 +7,10 @@ const bcrypt  = require("bcrypt");
 const auth    = require("../../middleware/auth");
 const { requireSuperAdmin } = require("../../middleware/role");
 
+const {
+  createSubAccountForBranch,
+} = require("../../services/monnify");
+
 // All super admin routes require auth + super admin role
 router.use(auth, requireSuperAdmin);
 
@@ -103,17 +107,25 @@ router.get("/stats", async (req, res) => {
       prisma.booking.count({ where: { ...dateFilter, ...parkFilter } }),
       prisma.user.count({ where: { role: "BRANCH_ADMIN" } }),
       // ── FIXED: revenue uses aggregate on totalAmount where PAID ──────────
-      prisma.booking.aggregate({
-        _sum:  { totalAmount: true },
-        where: { ...dateFilter, ...parkFilter, paymentStatus: "PAID" },
-      }),
-      prisma.booking.count({
-        where: { ...dateFilter, ...parkFilter, bookingSource: "WHATSAPP", paymentStatus: "PAID" },
-      }),
-      prisma.booking.count({
-        where: { ...dateFilter, ...parkFilter, bookingSource: { not: "WHATSAPP" }, status: "CONFIRMED" },
-      }),
-    ]);
+    // In GET /api/super/stats, replace revenueAgg:
+prisma.booking.aggregate({
+  _sum:  { totalAmount: true },
+  where: {
+    ...dateFilter,
+    ...parkFilter,
+    paymentStatus: "PAID",
+    // ── removed paymentReference filter — counts CASH too ──
+  },
+}),
+
+// And fix onlinePayments + offlinePayments:
+prisma.booking.count({
+  where: { ...dateFilter, ...parkFilter, paymentStatus: "PAID", paymentMethod: "ONLINE" },
+}),
+prisma.booking.count({
+  where: { ...dateFilter, ...parkFilter, paymentStatus: "PAID", paymentMethod: { in: ["CASH", "TRANSFER"] } },
+}),
+]);
 
     const totalRevenue = revenueAgg._sum.totalAmount || 0;
 
@@ -193,6 +205,16 @@ router.get("/chart", async (req, res) => {
   } catch (err) {
     console.error("SA CHART ERROR:", err);
     res.status(500).json({ message: "Chart error" });
+  }
+});
+
+router.post("/branches/retry-subaccounts", async (req, res) => {
+  try {
+    await retryMissingSubAccounts(prisma);
+    res.json({ message: "Retry complete — check server logs for details" });
+  } catch (err) {
+    console.error("RETRY SUB-ACCOUNTS ERROR:", err);
+    res.status(500).json({ message: "Retry failed" });
   }
 });
 
@@ -335,15 +357,69 @@ router.post("/parks", async (req, res) => {
 
 router.post("/branches", async (req, res) => {
   try {
-    const { name, parkId } = req.body;
-    if (!name || !parkId) return res.status(400).json({ message: "Branch name and parkId are required" });
+    const { name, parkId, accountNumber, bankName, accountName } = req.body;
+
+    if (!name || !parkId) {
+      return res.status(400).json({ message: "Branch name and parkId are required" });
+    }
+
     const park = await prisma.park.findUnique({ where: { id: parkId } });
     if (!park) return res.status(404).json({ message: "Park not found" });
-    const branch = await prisma.branch.create({ data: { name, parkId } });
-    res.status(201).json(branch);
+
+    // ── Step 1: Create branch in DB ───────────────────────────────
+    const branch = await prisma.branch.create({
+      data: {
+        name,
+        parkId,
+        accountNumber: accountNumber?.trim() || null,
+        bankName:      bankName?.trim()      || null,
+        accountName:   accountName?.trim()   || null,
+      },
+    });
+
+    console.log(`[Branch] Created: "${branch.name}" (${branch.id})`);
+
+    // ── Step 2: Register Monnify sub-account (non-blocking) ───────
+    // Only attempt if bank details are provided.
+    // Branch creation NEVER fails due to Monnify errors.
+    if (branch.accountNumber && branch.bankName) {
+      try {
+        console.log(`[Branch] Attempting Monnify sub-account for "${branch.name}"...`);
+
+        const subAccountCode = await createSubAccountForBranch(branch);
+
+        await prisma.branch.update({
+          where: { id: branch.id },
+          data:  { monnifySubAccountCode: subAccountCode },
+        });
+
+        branch.monnifySubAccountCode = subAccountCode;
+
+        console.log(`[Branch] ✅ Sub-account saved for "${branch.name}": ${subAccountCode}`);
+      } catch (monnifyErr) {
+        // Log clearly — never crash
+        console.error(
+          `[Branch] ❌ Monnify sub-account failed for "${branch.name}":`,
+          monnifyErr.message
+        );
+        console.warn(
+          `[Branch] Branch was still created successfully. ` +
+          `Run retryMissingSubAccounts() to backfill later.`
+        );
+      }
+    } else {
+      console.log(
+        `[Branch] Skipped Monnify sub-account for "${branch.name}" ` +
+        `— accountNumber or bankName not provided.`
+      );
+    }
+
+    // ── Step 3: Return branch (with subAccountCode if set) ────────
+    return res.status(201).json(branch);
+
   } catch (err) {
     console.error("SA CREATE BRANCH ERROR:", err);
-    res.status(500).json({ message: "Failed to create branch" });
+    return res.status(500).json({ message: "Failed to create branch" });
   }
 });
 

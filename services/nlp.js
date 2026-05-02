@@ -20,8 +20,6 @@
 "use strict";
 
 /* ── Known Nigerian cities / transport hubs ──────────────────────────────── */
-// Used to disambiguate city names from noise words.
-// Extend this list as your routes grow.
 const KNOWN_CITIES = [
   "lagos", "abuja", "kano", "ibadan", "kaduna", "port harcourt", "benin",
   "maiduguri", "zaria", "aba", "jos", "ilorin", "oyo", "enugu", "abeokuta",
@@ -36,13 +34,13 @@ const KNOWN_CITIES = [
 const ROUTE_CONNECTORS = /\s+(?:to|[-–—])\s+/i;
 
 /* ── Date relative keywords ──────────────────────────────────────────────── */
-const TODAY_WORDS     = /\b(today|now|tonight)\b/i;
-const TOMORROW_WORDS  = /\b(tomorrow|tmr|tmrw)\b/i;
-const DAYAFTER_WORDS  = /\b(day after tomorrow|overmorrow)\b/i;
+const TODAY_WORDS    = /\b(today|now|tonight)\b/i;
+const TOMORROW_WORDS = /\b(tomorrow|tmr|tmrw)\b/i;
+const DAYAFTER_WORDS = /\b(day after tomorrow|overmorrow)\b/i;
 
-/* ── Explicit date formats: DD-MM-YYYY, DD/MM/YYYY, YYYY-MM-DD ───────────── */
-const DATE_DMY  = /\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/;
-const DATE_YMD  = /\b(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})\b/;
+/* ── Explicit date formats ───────────────────────────────────────────────── */
+const DATE_DMY = /\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b/;
+const DATE_YMD = /\b(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})\b/;
 
 /* ── Seat count patterns ─────────────────────────────────────────────────── */
 const SEAT_PATTERNS = [
@@ -51,74 +49,94 @@ const SEAT_PATTERNS = [
 ];
 
 /* ── Intent keywords ─────────────────────────────────────────────────────── */
-const BOOK_WORDS  = /\b(book|reserve|get|buy|travel|trip|journey|ride|going|i want|i need|take me)\b/i;
-const CHECK_WORDS = /\b(check|find|lookup|status|where is|track|my booking)\b/i;
-const CANCEL_WORDS= /\b(cancel|stop|abort)\b/i;
-const MENU_WORDS  = /\b(menu|start|restart|hi|hello|hey|back|home)\b/i;
+const BOOK_WORDS   = /\b(book|reserve|get|buy|travel|trip|journey|ride|going|i want|i need|take me)\b/i;
+const CHECK_WORDS  = /\b(check|find|lookup|status|where is|track|my booking)\b/i;
+const CANCEL_WORDS = /\b(cancel|stop|abort)\b/i;
+const MENU_WORDS   = /\b(menu|start|restart|hi|hello|hey|back|home)\b/i;
 
-/* ══════════════════════════════════════════════════════════════════════════ */
+/* ══════════════════════════════════════════════════════════════════════════
+   WAT HELPERS
+   ──────────────────────────────────────────────────────────────────────────
+   All date comparisons and "today/tomorrow" resolution use Africa/Lagos
+   (WAT = UTC+1) so the bot behaves correctly regardless of the server's
+   system timezone (e.g. UTC on most cloud hosts).
+══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * Resolve a relative or absolute date string to a Date object.
- * Returns null for invalid or past dates.
- *
- * @param {string} text
- * @returns {Date|null}
+ * Returns a Date anchored to WAT midnight (00:00:00 +01:00) for today.
+ * @returns {Date}
  */
+function getTodayWAT() {
+  const str = new Date().toLocaleDateString("en-CA", { timeZone: "Africa/Lagos" });
+  return new Date(`${str}T00:00:00+01:00`);
+}
+
+/**
+ * Returns a Date anchored to WAT midnight for tomorrow.
+ * @returns {Date}
+ */
+function getTomorrowWAT() {
+  const d = getTodayWAT();
+  d.setDate(d.getDate() + 1);
+  return d;
+}
+
+/**
+ * Returns a Date anchored to WAT midnight N days from today.
+ * @param {number} n
+ * @returns {Date}
+ */
+function getWATDateOffset(n) {
+  const d = getTodayWAT();
+  d.setDate(d.getDate() + n);
+  return d;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   resolveDate
+   ──────────────────────────────────────────────────────────────────────────
+   Converts a relative or absolute date string to a WAT-anchored Date.
+   Returns null for unrecognised or past dates.
+══════════════════════════════════════════════════════════════════════════ */
 function resolveDate(text) {
-  const t   = text.trim();
-  const now = new Date();
-  now.setHours(0, 0, 0, 0);
+  const t       = (text || "").trim();
+  const todayWAT = getTodayWAT();
 
-  if (TODAY_WORDS.test(t)) {
-    return new Date(now);
-  }
+  if (TODAY_WORDS.test(t))    return getTodayWAT();
+  if (TOMORROW_WORDS.test(t)) return getTomorrowWAT();
+  if (DAYAFTER_WORDS.test(t)) return getWATDateOffset(2);
 
-  if (TOMORROW_WORDS.test(t)) {
-    const d = new Date(now);
-    d.setDate(d.getDate() + 1);
-    return d;
-  }
-
-  if (DAYAFTER_WORDS.test(t)) {
-    const d = new Date(now);
-    d.setDate(d.getDate() + 2);
-    return d;
-  }
-
-  // DD-MM-YYYY or DD/MM/YYYY
+  // DD-MM-YYYY or DD/MM/YYYY or DD-MM-YY
   let m = DATE_DMY.exec(t);
   if (m) {
-    const date = new Date(`${m[3]}-${m[2].padStart(2,"0")}-${m[1].padStart(2,"0")}`);
-    if (!isNaN(date.getTime()) && date >= now) return date;
-    return null; // past date
+    const fullYear = m[3].length === 2 ? "20" + m[3] : m[3];
+    const date = new Date(
+      `${fullYear}-${m[2].padStart(2,"0")}-${m[1].padStart(2,"0")}T00:00:00+01:00`
+    );
+    if (!isNaN(date.getTime()) && date >= todayWAT) return date;
+    return null;
   }
 
   // YYYY-MM-DD
   m = DATE_YMD.exec(t);
   if (m) {
-    const date = new Date(`${m[1]}-${m[2].padStart(2,"0")}-${m[3].padStart(2,"0")}`);
-    if (!isNaN(date.getTime()) && date >= now) return date;
+    const date = new Date(
+      `${m[1]}-${m[2].padStart(2,"0")}-${m[3].padStart(2,"0")}T00:00:00+01:00`
+    );
+    if (!isNaN(date.getTime()) && date >= todayWAT) return date;
     return null;
   }
 
   return null;
 }
 
-/**
- * Try to extract a city name from a raw token.
- * First checks against the known-city list (longest-match),
- * then falls back to any word(s) that look like a proper noun (capitalised
- * or following a location keyword).
- *
- * @param {string} token  - raw text fragment
- * @returns {string|null}
- */
+/* ══════════════════════════════════════════════════════════════════════════
+   extractCity
+══════════════════════════════════════════════════════════════════════════ */
 function extractCity(token) {
   const lower = token.trim().toLowerCase();
   if (!lower || lower.length < 2) return null;
 
-  // Reject obvious noise words
   const NOISE = new Set([
     "a","an","the","i","my","me","we","us","our","from","to","at","in","on",
     "and","or","for","of","is","are","was","were","be","been","have","has",
@@ -130,14 +148,12 @@ function extractCity(token) {
 
   if (NOISE.has(lower)) return null;
 
-  // Check known cities (multi-word first, then single)
   for (const city of KNOWN_CITIES) {
     if (lower === city || lower.startsWith(city) || lower.endsWith(city)) {
       return city.split(" ").map(w => w[0].toUpperCase() + w.slice(1)).join(" ");
     }
   }
 
-  // Fallback: treat as city if ≥ 3 chars and not a number
   if (lower.length >= 3 && !/^\d+$/.test(lower)) {
     return token.trim().split(" ")
       .map(w => w[0]?.toUpperCase() + w.slice(1).toLowerCase())
@@ -147,19 +163,9 @@ function extractCity(token) {
   return null;
 }
 
-/**
- * Parse a free-text message and return structured intent data.
- *
- * @param {string} rawText
- * @returns {{
- *   intent: "BOOK"|"CHECK"|"CANCEL"|"MENU"|"UNKNOWN",
- *   from:   string|null,
- *   to:     string|null,
- *   date:   Date|null,
- *   seats:  number|null,
- *   ref:    string|null,    // for CHECK intent
- * }}
- */
+/* ══════════════════════════════════════════════════════════════════════════
+   parseIntent
+══════════════════════════════════════════════════════════════════════════ */
 function parseIntent(rawText) {
   const text  = (rawText || "").trim();
   const lower = text.toLowerCase();
@@ -173,11 +179,10 @@ function parseIntent(rawText) {
     ref:    null,
   };
 
-  /* ── Detect intent ──────────────────────────────────────────────────────── */
+  /* ── Intent ── */
   if (MENU_WORDS.test(lower))   { result.intent = "MENU";   return result; }
   if (CANCEL_WORDS.test(lower)) { result.intent = "CANCEL"; return result; }
 
-  // Reference code check (GT-XXXXXX)
   const refMatch = /\b(GT-[A-Z0-9]{5,8})\b/i.exec(text);
   if (refMatch) {
     result.intent = "CHECK";
@@ -185,13 +190,13 @@ function parseIntent(rawText) {
     return result;
   }
 
-  if (CHECK_WORDS.test(lower))  { result.intent = "CHECK";  }
-  if (BOOK_WORDS.test(lower))   { result.intent = "BOOK";   }
+  if (CHECK_WORDS.test(lower)) result.intent = "CHECK";
+  if (BOOK_WORDS.test(lower))  result.intent = "BOOK";
 
-  /* ── Extract date ───────────────────────────────────────────────────────── */
+  /* ── Date ── */
   result.date = resolveDate(lower);
 
-  /* ── Extract seat count ─────────────────────────────────────────────────── */
+  /* ── Seat count ── */
   for (const pattern of SEAT_PATTERNS) {
     const m = pattern.exec(lower);
     if (m) {
@@ -200,8 +205,7 @@ function parseIntent(rawText) {
     }
   }
 
-  /* ── Extract route (origin → destination) ───────────────────────────────── */
-  // Strategy 1: explicit "from X to Y" pattern
+  /* ── Route: strategy 1 — "from X to Y" ── */
   const fromTo = /\bfrom\s+(.+?)\s+to\s+(.+?)(?:\s+on|\s+\d|\s+today|\s+tomorrow|$)/i.exec(text);
   if (fromTo) {
     const maybeFrom = extractCity(fromTo[1]);
@@ -210,9 +214,8 @@ function parseIntent(rawText) {
     if (maybeTo)   result.to   = maybeTo;
   }
 
-  // Strategy 2: "X to Y" or "X - Y" anywhere in the text (if strategy 1 missed)
+  /* ── Route: strategy 2 — "X to Y" or "X - Y" ── */
   if (!result.from || !result.to) {
-    // Strip noise prefixes before trying
     const stripped = text
       .replace(/\b(book|reserve|get|i want|i need|any trip|a trip|travel|going)\b/gi, "")
       .replace(/\b(today|tomorrow|tmr|now|tonight|day after tomorrow)\b/gi, "")
@@ -231,7 +234,6 @@ function parseIntent(rawText) {
     }
   }
 
-  // If we found a route, treat ambiguous intent as BOOK
   if (result.intent === "UNKNOWN" && (result.from || result.to)) {
     result.intent = "BOOK";
   }
@@ -239,4 +241,4 @@ function parseIntent(rawText) {
   return result;
 }
 
-module.exports = { parseIntent, resolveDate };
+module.exports = { parseIntent, resolveDate, getTodayWAT, getTomorrowWAT };
