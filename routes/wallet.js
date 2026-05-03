@@ -9,13 +9,12 @@ const { requireSuperAdmin, requireBranchMember } = require("../middleware/role")
 const {
   creditWallet,
   initiateMonnifyFunding,
+  getExistingMonnifyAccount,
   verifyWalletWebhookSignature,
 } = require("../services/wallet");
 
 /* ══════════════════════════════════════════════
    GET /api/wallet
-   Branch admin sees their own wallet balance.
-   Super admin must pass ?branchId=
 ══════════════════════════════════════════════ */
 router.get("/", auth, requireBranchMember, async (req, res) => {
   try {
@@ -40,19 +39,18 @@ router.get("/", auth, requireBranchMember, async (req, res) => {
 
     if (!branch) return res.status(404).json({ message: "Branch not found" });
 
-    // Branch admins can only see their own wallet
     if (req.user.role !== "SUPER_ADMIN" && req.user.branchId !== branchId) {
       return res.status(403).json({ message: "Access denied" });
     }
 
     return res.json({
-      branchId:    branch.id,
-      branchName:  branch.name,
-      balance:     branch.walletBalance,
-      enabled:     branch.walletEnabled,
-      lowBalance:  branch.walletBalance < 1000,
-      exhausted:   branch.walletBalance < 50,
-      updatedAt:   branch.updatedAt,
+      branchId:   branch.id,
+      branchName: branch.name,
+      balance:    branch.walletBalance,
+      enabled:    branch.walletEnabled,
+      lowBalance: branch.walletBalance < 1000,
+      exhausted:  branch.walletBalance < 50,
+      updatedAt:  branch.updatedAt,
     });
   } catch (err) {
     console.error("WALLET GET ERROR:", err);
@@ -62,8 +60,6 @@ router.get("/", auth, requireBranchMember, async (req, res) => {
 
 /* ══════════════════════════════════════════════
    GET /api/wallet/transactions
-   Paginated transaction history for branch.
-   Query: ?page=1&limit=20&type=CREDIT|DEBIT
 ══════════════════════════════════════════════ */
 router.get("/transactions", auth, requireBranchMember, async (req, res) => {
   try {
@@ -113,9 +109,14 @@ router.get("/transactions", auth, requireBranchMember, async (req, res) => {
 
 /* ══════════════════════════════════════════════
    POST /api/wallet/fund
-   Branch requests to top up wallet.
-   Creates PENDING transaction + Monnify account.
-   Body: { amount: number }
+   ──────────────────────────────────────────────
+   1. If a PENDING top-up already exists for this
+      branch, reuse its Monnify reserved account
+      instead of creating a duplicate (422).
+   2. If the existing Monnify account can't be
+      fetched, mark it FAILED and create fresh.
+   3. Otherwise create a brand new transaction
+      and Monnify reserved account.
 ══════════════════════════════════════════════ */
 router.post("/fund", auth, requireBranchMember, async (req, res) => {
   try {
@@ -133,13 +134,45 @@ router.post("/fund", auth, requireBranchMember, async (req, res) => {
       where:  { id: branchId },
       select: { id: true, name: true },
     });
-
     if (!branch) return res.status(404).json({ message: "Branch not found" });
 
-    // Generate unique reference for this funding request
+    // ── Check for existing PENDING top-up ──────────────────────────
+    // Reuse it so we never hit a 422 duplicate on Monnify
+    const existingTx = await prisma.walletTransaction.findFirst({
+      where:   { branchId, type: "CREDIT", status: "PENDING" },
+      orderBy: { createdAt: "desc" },
+    });
+
+    if (existingTx) {
+      console.log(`[Wallet] Found existing PENDING tx: ${existingTx.reference} — attempting reuse`);
+
+      try {
+        const monnifyData = await getExistingMonnifyAccount(existingTx.reference);
+
+        console.log(`[Wallet] Reusing Monnify account for ref: ${existingTx.reference}`);
+
+        return res.status(200).json({
+          message:       "You have a pending top-up. Transfer to complete it.",
+          reference:     existingTx.reference,
+          amount:        existingTx.amount,
+          accountNumber: monnifyData.accountNumber,
+          bankName:      monnifyData.bankName,
+          accountName:   monnifyData.accountName,
+          instruction:   `Transfer exactly ₦${Number(existingTx.amount).toLocaleString("en-NG")} to confirm your wallet top-up.`,
+        });
+      } catch (reuseErr) {
+        // Monnify account unretrievable — cancel stuck tx and fall through to fresh creation
+        console.warn(`[Wallet] Could not reuse existing tx (${reuseErr.message}) — marking FAILED and creating fresh`);
+        await prisma.walletTransaction.update({
+          where: { id: existingTx.id },
+          data:  { status: "FAILED" },
+        });
+      }
+    }
+
+    // ── Create fresh transaction + Monnify account ─────────────────
     const reference = `WFUND-${branchId.slice(0, 6)}-${Date.now()}`;
 
-    // Create PENDING transaction first
     await prisma.walletTransaction.create({
       data: {
         branchId,
@@ -151,7 +184,6 @@ router.post("/fund", auth, requireBranchMember, async (req, res) => {
       },
     });
 
-    // Create Monnify reserved account for the payment
     const monnifyData = await initiateMonnifyFunding({
       branchId,
       branchName: branch.name,
@@ -170,6 +202,7 @@ router.post("/fund", auth, requireBranchMember, async (req, res) => {
       accountName:   monnifyData.accountName,
       instruction:   `Transfer exactly ₦${Number(amount).toLocaleString("en-NG")} to confirm your wallet top-up.`,
     });
+
   } catch (err) {
     console.error("WALLET FUND ERROR:", err.message);
     return res.status(500).json({ message: "Failed to initialize wallet funding. Try again." });
@@ -178,11 +211,8 @@ router.post("/fund", auth, requireBranchMember, async (req, res) => {
 
 /* ══════════════════════════════════════════════
    POST /api/wallet/webhook
-   Monnify fires this after successful transfer.
-   Must be mounted BEFORE express.json() in server.js.
-
-   Verifies signature → credits wallet → marks SUCCESS.
-   Idempotent: duplicate references are ignored.
+   Kept here as fallback but primary handling
+   is now inside monnifyWebhook.js unified handler.
 ══════════════════════════════════════════════ */
 router.post(
   "/webhook",
@@ -191,13 +221,11 @@ router.post(
     const signature = req.headers["monnify-signature"];
     const rawBody   = req.body;
 
-    // ── 1. Verify signature ──────────────────────────────────────
     if (!signature || !verifyWalletWebhookSignature(rawBody, signature)) {
       console.warn("[Wallet Webhook] Invalid or missing signature — rejected");
       return res.status(401).json({ error: "Invalid signature" });
     }
 
-    // ── 2. Parse payload ─────────────────────────────────────────
     let payload;
     try {
       payload = JSON.parse(rawBody.toString());
@@ -206,22 +234,17 @@ router.post(
     }
 
     console.log("[Wallet Webhook] Received:", JSON.stringify(payload, null, 2));
-
-    // Acknowledge immediately
     res.status(200).json({ received: true });
 
     const { eventType, eventData } = payload;
 
-    // Only process successful payments
     const SUCCESS_EVENTS = ["SUCCESSFUL_TRANSACTION", "PAYMENT_STATUS_CHANGED"];
     if (!SUCCESS_EVENTS.includes(eventType)) return;
     if (eventType === "PAYMENT_STATUS_CHANGED" && eventData?.paymentStatus !== "PAID") return;
 
-    // ── 3. Find the matching PENDING wallet transaction ──────────
-    // accountReference = "WALLET-{reference}" set during fund init
-    const accountReference = eventData?.accountReference || "";
-    const reference        = accountReference.replace(/^WALLET-/, "");
-    const amountPaid       = eventData?.amountPaid || 0;
+    const productRef = eventData?.product?.reference || eventData?.accountReference || "";
+    const reference  = productRef.replace(/^WALLET-/, "");
+    const amountPaid = eventData?.amountPaid || 0;
 
     try {
       const transaction = await prisma.walletTransaction.findUnique({
@@ -233,13 +256,11 @@ router.post(
         return;
       }
 
-      // ── 4. Idempotency: already credited → skip ───────────────
       if (transaction.status === "SUCCESS") {
         console.log(`[Wallet Webhook] Already credited: ${reference} — skipping`);
         return;
       }
 
-      // ── 5. Credit wallet atomically ───────────────────────────
       await prisma.$transaction(async (tx) => {
         await creditWallet(
           tx,
@@ -250,9 +271,7 @@ router.post(
         );
       });
 
-      console.log(
-        `[Wallet Webhook] ✅ Credited ₦${amountPaid} to branch ${transaction.branchId} | Ref: ${reference}`
-      );
+      console.log(`[Wallet Webhook] ✅ Credited ₦${amountPaid} to branch ${transaction.branchId} | Ref: ${reference}`);
 
     } catch (err) {
       console.error("[Wallet Webhook] Processing error:", err.message);
@@ -262,8 +281,6 @@ router.post(
 
 /* ══════════════════════════════════════════════
    POST /api/wallet/deposit (Super Admin only)
-   Manual top-up without Monnify.
-   Body: { branchId, amount, reference?, description? }
 ══════════════════════════════════════════════ */
 router.post("/deposit", auth, requireSuperAdmin, async (req, res) => {
   try {
@@ -277,7 +294,6 @@ router.post("/deposit", auth, requireSuperAdmin, async (req, res) => {
     const ref = reference || `SADEP-${branchId.slice(0, 6)}-${Date.now()}`;
 
     const branch = await prisma.$transaction(async (tx) => {
-      // Create the transaction record first
       await tx.walletTransaction.create({
         data: {
           branchId,
@@ -289,10 +305,9 @@ router.post("/deposit", auth, requireSuperAdmin, async (req, res) => {
         },
       });
 
-      // Credit the balance
       return tx.branch.update({
-        where: { id: branchId },
-        data:  { walletBalance: { increment: Number(amount) } },
+        where:  { id: branchId },
+        data:   { walletBalance: { increment: Number(amount) } },
         select: { id: true, name: true, walletBalance: true },
       });
     });
@@ -315,7 +330,6 @@ router.post("/deposit", auth, requireSuperAdmin, async (req, res) => {
 
 /* ══════════════════════════════════════════════
    GET /api/wallet/all (Super Admin only)
-   All branch wallets overview.
 ══════════════════════════════════════════════ */
 router.get("/all", auth, requireSuperAdmin, async (req, res) => {
   try {
@@ -349,8 +363,6 @@ router.get("/all", auth, requireSuperAdmin, async (req, res) => {
 
 /* ══════════════════════════════════════════════
    PATCH /api/wallet/toggle (Super Admin only)
-   Enable/disable wallet enforcement for a branch.
-   Body: { branchId, enabled: boolean }
 ══════════════════════════════════════════════ */
 router.patch("/toggle", auth, requireSuperAdmin, async (req, res) => {
   try {

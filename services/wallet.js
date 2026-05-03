@@ -209,6 +209,38 @@ async function initiateMonnifyFunding({ branchId, branchName, amount, reference 
 }
 
 /* ══════════════════════════════════════════════
+   getExistingMonnifyAccount
+   Fetches a previously created reserved account
+   from Monnify by its accountReference.
+   Called when reusing a PENDING transaction.
+══════════════════════════════════════════════ */
+async function getExistingMonnifyAccount(reference) {
+  const token = await getMonnifyToken();
+  const accountReference = `WALLET-${reference}`;
+
+  // Monnify: GET reserved account by accountReference
+  const { data } = await axios.get(
+    `${BASE_URL}/api/v2/bank-transfer/reserved-accounts/${accountReference}`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+
+  if (!data.requestSuccessful) {
+    throw new Error(`Could not fetch Monnify account: ${data.responseMessage}`);
+  }
+
+  const body    = data.responseBody;
+  const account = Array.isArray(body.accounts) && body.accounts.length
+    ? body.accounts[0]
+    : body;
+
+  return {
+    accountNumber: account.accountNumber,
+    bankName:      account.bankName,
+    accountName:   body.accountName,
+  };
+}
+
+/* ══════════════════════════════════════════════
    verifyWalletWebhookSignature
 ══════════════════════════════════════════════ */
 function verifyWalletWebhookSignature(rawBody, signature) {
@@ -255,6 +287,7 @@ module.exports = {
   checkAndDeductWallet,
   creditWallet,
   initiateMonnifyFunding,
+  getExistingMonnifyAccount,
   verifyWalletWebhookSignature,
   retryMissingSubAccounts,
   BOOKING_FEE,
