@@ -1,4 +1,4 @@
-// routes/auth.js  (login handler — add parkId to token)
+// routes/auth.js
 const express = require("express");
 const router  = express.Router();
 const bcrypt  = require("bcrypt");
@@ -8,16 +8,15 @@ const prisma  = require("../prismaClient");
 router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-
     if (!email || !password) {
       return res.status(400).json({ message: "Email and password required" });
     }
 
+    // User has no direct park relation — park is always reached via branch
     const user = await prisma.user.findUnique({
       where:   { email },
       include: {
         branch: { include: { park: true } },
-        park:   true,   // for PARK_ADMIN — their directly assigned park
       },
     });
 
@@ -34,17 +33,15 @@ router.post("/login", async (req, res) => {
       return res.status(403).json({ message: "Account suspended", suspended: true });
     }
 
-    // ── Determine parkId ─────────────────────────────────────────
-    // PARK_ADMIN  → user.parkId (directly assigned)
-    // BRANCH_ADMIN / STAFF → user.branch.parkId (via branch)
-    const parkId = user.parkId || user.branch?.parkId || null;
-    const parkName = user.park?.name || user.branch?.park?.name || null;
+    // Park is always via branch for all roles
+    const parkId   = user.branch?.park?.id   || null;
+    const parkName = user.branch?.park?.name || null;
 
     const token = jwt.sign(
       {
         id:         user.id,
         role:       user.role,
-        branchId:   user.branchId   || null,
+        branchId:   user.branchId     || null,
         branchName: user.branch?.name || null,
         parkId,
         parkName,
@@ -57,7 +54,7 @@ router.post("/login", async (req, res) => {
       token,
       role:       user.role,
       name:       user.name,
-      branchId:   user.branchId || null,
+      branchId:   user.branchId     || null,
       branchName: user.branch?.name || null,
       parkId,
       parkName,
