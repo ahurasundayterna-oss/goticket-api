@@ -3,12 +3,35 @@
 
 const axios  = require("axios");
 const crypto = require("crypto");
+const prisma  = require("../prismaClient");
 
 const BOOKING_FEE      = 50;
 const LOW_BALANCE_WARN = 1000;
-const BASE_URL         = process.env.MONNIFY_BASE_URL   || "https://sandbox.monnify.com";
+const BASE_URL         = process.env.MONNIFY_BASE_URL    || "https://sandbox.monnify.com";
 const CONTRACT_CODE    = process.env.MONNIFY_CONTRACT_CODE;
 const SECRET_KEY       = process.env.MONNIFY_SECRET_KEY;
+
+/* ══════════════════════════════════════════════
+   getMonnifyToken
+   Shared auth helper — gets a fresh access token.
+══════════════════════════════════════════════ */
+async function getMonnifyToken() {
+  const credentials = Buffer.from(
+    `${process.env.MONNIFY_API_KEY}:${SECRET_KEY}`
+  ).toString("base64");
+
+  const authRes = await axios.post(
+    `${BASE_URL}/api/v1/auth/login`,
+    {},
+    { headers: { Authorization: `Basic ${credentials}` } }
+  );
+
+  if (!authRes.data.requestSuccessful) {
+    throw new Error(`Monnify auth failed: ${authRes.data.responseMessage}`);
+  }
+
+  return authRes.data.responseBody.accessToken;
+}
 
 /* ══════════════════════════════════════════════
    checkAndDeductWallet
@@ -73,7 +96,6 @@ async function creditWallet(tx, branchId, amount, reference, description) {
     data:  { walletBalance: { increment: amount } },
   });
 
-  // Mark the pending transaction as SUCCESS
   await tx.walletTransaction.updateMany({
     where: { reference, branchId, status: "PENDING" },
     data:  { status: "SUCCESS" },
@@ -89,31 +111,20 @@ async function creditWallet(tx, branchId, amount, reference, description) {
 
 /* ══════════════════════════════════════════════
    initiateMonnifyFunding
-   Creates a Monnify reserved account for
-   the branch to transfer their top-up into.
+   ──────────────────────────────────────────────
+   Strategy:
+   1. Try to create a new reserved account.
+   2. If Monnify returns 422 (duplicate accountReference),
+      fetch the existing account by that reference instead.
+   This makes the endpoint idempotent — safe to retry.
 ══════════════════════════════════════════════ */
 async function initiateMonnifyFunding({ branchId, branchName, amount, reference }) {
-  // Get fresh auth token
-  const credentials = Buffer.from(
-    `${process.env.MONNIFY_API_KEY}:${SECRET_KEY}`
-  ).toString("base64");
-
-  const authRes = await axios.post(
-    `${BASE_URL}/api/v1/auth/login`,
-    {},
-    { headers: { Authorization: `Basic ${credentials}` } }
-  );
-
-  if (!authRes.data.requestSuccessful) {
-    throw new Error(`Monnify auth failed: ${authRes.data.responseMessage}`);
-  }
-
-  const token      = authRes.data.responseBody.accessToken;
-  const safeRef    = reference.replace(/[^a-zA-Z0-9_-]/g, "");
-  const safePhone  = "08000000000"; // placeholder for wallet funding
+  const token   = await getMonnifyToken();
+  const safeRef = reference.replace(/[^a-zA-Z0-9_-]/g, "");
+  const accountReference = `WALLET-${safeRef}`;
 
   const payload = {
-    accountReference:    `WALLET-${safeRef}`,
+    accountReference,
     accountName:         `GoTicket Wallet — ${branchName}`,
     customerEmail:       `wallet.${branchId.slice(0, 8)}@goticket.ng`,
     customerName:        branchName,
@@ -123,22 +134,68 @@ async function initiateMonnifyFunding({ branchId, branchName, amount, reference 
     description:         `GoTicket wallet top-up — ₦${amount}`,
   };
 
-  const { data } = await axios.post(
-    `${BASE_URL}/api/v2/bank-transfer/reserved-accounts`,
-    payload,
-    {
-      headers: {
-        Authorization:  `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-    }
-  );
+  console.log("[Monnify] Creating reserved account:", JSON.stringify(payload, null, 2));
 
-  if (!data.requestSuccessful) {
-    throw new Error(`Monnify funding init failed: ${data.responseMessage}`);
+  let body;
+
+  try {
+    const { data } = await axios.post(
+      `${BASE_URL}/api/v2/bank-transfer/reserved-accounts`,
+      payload,
+      {
+        headers: {
+          Authorization:  `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    if (!data.requestSuccessful) {
+      console.error("[Monnify] Create failed:", JSON.stringify(data, null, 2));
+      throw new Error(`Monnify funding init failed: ${data.responseMessage}`);
+    }
+
+    body = data.responseBody;
+    console.log("[Monnify] Reserved account created:", accountReference);
+
+  } catch (err) {
+    // 422 = accountReference already exists on Monnify — fetch it instead
+    if (err.response?.status === 422) {
+      console.warn(
+        `[Monnify] 422 — accountReference "${accountReference}" already exists. ` +
+        `Fetching existing account...`
+      );
+
+      try {
+        const { data: existing } = await axios.get(
+          `${BASE_URL}/api/v2/bank-transfer/reserved-accounts/details`,
+          {
+            headers: { Authorization: `Bearer ${token}` },
+            params:  { accountReference },
+          }
+        );
+
+        if (!existing.requestSuccessful) {
+          console.error("[Monnify] Fetch existing failed:", JSON.stringify(existing, null, 2));
+          throw new Error(`Could not fetch existing Monnify account: ${existing.responseMessage}`);
+        }
+
+        body = existing.responseBody;
+        console.log("[Monnify] Reusing existing reserved account:", accountReference);
+
+      } catch (fetchErr) {
+        console.error("[Monnify] Fetch existing account error:", fetchErr.message);
+        throw fetchErr;
+      }
+
+    } else {
+      // Some other error — rethrow
+      console.error("[Monnify] Unexpected error:", err.response?.data || err.message);
+      throw err;
+    }
   }
 
-  const body    = data.responseBody;
+  // Extract account details — Monnify returns accounts[] array
   const account = Array.isArray(body.accounts) && body.accounts.length
     ? body.accounts[0]
     : body;
@@ -153,8 +210,6 @@ async function initiateMonnifyFunding({ branchId, branchName, amount, reference 
 
 /* ══════════════════════════════════════════════
    verifyWalletWebhookSignature
-   Verifies the Monnify HMAC-SHA512 signature
-   on incoming wallet webhook payloads.
 ══════════════════════════════════════════════ */
 function verifyWalletWebhookSignature(rawBody, signature) {
   const expected = crypto
@@ -165,7 +220,7 @@ function verifyWalletWebhookSignature(rawBody, signature) {
 }
 
 /* ══════════════════════════════════════════════
-   retryMissingSubAccounts (unchanged helper)
+   retryMissingSubAccounts
 ══════════════════════════════════════════════ */
 async function retryMissingSubAccounts(prisma) {
   const branches = await prisma.branch.findMany({
