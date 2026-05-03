@@ -14,14 +14,7 @@ const paymentsRoutes = require("./routes/payments");
 // Monnify booking webhook
 app.use("/api/monnify/webhook", require("./routes/monnifyWebhook"));
 
-// Wallet funding webhook — extract the handler directly from the router
-// so express.raw() wraps it correctly on this exact path
-const walletWebhookHandler = require("./routes/wallet/webhook");
-app.post(
-  "/api/wallet/webhook",
-  express.raw({ type: "application/json" }),
-  walletWebhookHandler
-);
+// All Monnify webhooks (bookings + wallet) handled in one place above
 
 /* ══════════════════════════════════════════════
    NORMAL MIDDLEWARE
