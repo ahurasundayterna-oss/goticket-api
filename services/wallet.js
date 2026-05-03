@@ -212,32 +212,44 @@ async function initiateMonnifyFunding({ branchId, branchName, amount, reference 
    getExistingMonnifyAccount
    Fetches a previously created reserved account
    from Monnify by its accountReference.
-   Called when reusing a PENDING transaction.
 ══════════════════════════════════════════════ */
 async function getExistingMonnifyAccount(reference) {
-  const token = await getMonnifyToken();
+  const token            = await getMonnifyToken();
   const accountReference = `WALLET-${reference}`;
+  const encodedRef       = encodeURIComponent(accountReference);
 
-  // Monnify: GET reserved account by accountReference
-  const { data } = await axios.get(
-    `${BASE_URL}/api/v2/bank-transfer/reserved-accounts/${accountReference}`,
-    { headers: { Authorization: `Bearer ${token}` } }
-  );
+  // Monnify sandbox: GET /api/v2/bank-transfer/reserved-accounts/{accountReference}
+  const url = `${BASE_URL}/api/v2/bank-transfer/reserved-accounts/${encodedRef}`;
+  console.log(`[Monnify] Fetching existing account: GET ${url}`);
 
-  if (!data.requestSuccessful) {
-    throw new Error(`Could not fetch Monnify account: ${data.responseMessage}`);
+  try {
+    const { data } = await axios.get(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    console.log("[Monnify] Fetch response:", JSON.stringify(data, null, 2));
+
+    if (!data.requestSuccessful) {
+      throw new Error(`Could not fetch Monnify account: ${data.responseMessage}`);
+    }
+
+    const body    = data.responseBody;
+    const account = Array.isArray(body.accounts) && body.accounts.length
+      ? body.accounts[0]
+      : body;
+
+    return {
+      accountNumber: account.accountNumber,
+      bankName:      account.bankName,
+      accountName:   body.accountName,
+    };
+
+  } catch (err) {
+    const status  = err.response?.status;
+    const errBody = err.response?.data;
+    console.error(`[Monnify] GET reserved account failed (${status}):`, JSON.stringify(errBody || err.message));
+    throw err;
   }
-
-  const body    = data.responseBody;
-  const account = Array.isArray(body.accounts) && body.accounts.length
-    ? body.accounts[0]
-    : body;
-
-  return {
-    accountNumber: account.accountNumber,
-    bankName:      account.bankName,
-    accountName:   body.accountName,
-  };
 }
 
 /* ══════════════════════════════════════════════
