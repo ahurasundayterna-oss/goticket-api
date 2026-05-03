@@ -9,7 +9,6 @@ const { requireSuperAdmin, requireBranchMember } = require("../middleware/role")
 const {
   creditWallet,
   initiateMonnifyFunding,
-  getExistingMonnifyAccount,
   verifyWalletWebhookSignature,
 } = require("../services/wallet");
 
@@ -110,13 +109,13 @@ router.get("/transactions", auth, requireBranchMember, async (req, res) => {
 /* ══════════════════════════════════════════════
    POST /api/wallet/fund
    ──────────────────────────────────────────────
-   1. If a PENDING top-up already exists for this
-      branch, reuse its Monnify reserved account
-      instead of creating a duplicate (422).
-   2. If the existing Monnify account can't be
-      fetched, mark it FAILED and create fresh.
-   3. Otherwise create a brand new transaction
-      and Monnify reserved account.
+   Monnify reserved accounts are PERMANENT per
+   customer. initiateMonnifyFunding always tries
+   GET first and only creates if no account exists.
+
+   We always create a fresh PENDING DB transaction
+   for tracking, but Monnify will reuse the same
+   reserved account (same bank details) every time.
 ══════════════════════════════════════════════ */
 router.post("/fund", auth, requireBranchMember, async (req, res) => {
   try {
@@ -136,41 +135,7 @@ router.post("/fund", auth, requireBranchMember, async (req, res) => {
     });
     if (!branch) return res.status(404).json({ message: "Branch not found" });
 
-    // ── Check for existing PENDING top-up ──────────────────────────
-    // Reuse it so we never hit a 422 duplicate on Monnify
-    const existingTx = await prisma.walletTransaction.findFirst({
-      where:   { branchId, type: "CREDIT", status: "PENDING" },
-      orderBy: { createdAt: "desc" },
-    });
-
-    if (existingTx) {
-      console.log(`[Wallet] Found existing PENDING tx: ${existingTx.reference} — attempting reuse`);
-
-      try {
-        const monnifyData = await getExistingMonnifyAccount(existingTx.reference);
-
-        console.log(`[Wallet] Reusing Monnify account for ref: ${existingTx.reference}`);
-
-        return res.status(200).json({
-          message:       "You have a pending top-up. Transfer to complete it.",
-          reference:     existingTx.reference,
-          amount:        existingTx.amount,
-          accountNumber: monnifyData.accountNumber,
-          bankName:      monnifyData.bankName,
-          accountName:   monnifyData.accountName,
-          instruction:   `Transfer exactly ₦${Number(existingTx.amount).toLocaleString("en-NG")} to confirm your wallet top-up.`,
-        });
-      } catch (reuseErr) {
-        // Monnify account unretrievable — cancel stuck tx and fall through to fresh creation
-        console.warn(`[Wallet] Could not reuse existing tx (${reuseErr.message}) — marking FAILED and creating fresh`);
-        await prisma.walletTransaction.update({
-          where: { id: existingTx.id },
-          data:  { status: "FAILED" },
-        });
-      }
-    }
-
-    // ── Create fresh transaction + Monnify account ─────────────────
+    // Create a fresh PENDING transaction for this top-up request
     const reference = `WFUND-${branchId.slice(0, 6)}-${Date.now()}`;
 
     await prisma.walletTransaction.create({
@@ -184,6 +149,9 @@ router.post("/fund", auth, requireBranchMember, async (req, res) => {
       },
     });
 
+    // initiateMonnifyFunding GETs existing account first,
+    // only creates a new one if none exists (404).
+    // No 422 duplicate errors possible with this approach.
     const monnifyData = await initiateMonnifyFunding({
       branchId,
       branchName: branch.name,
@@ -211,8 +179,8 @@ router.post("/fund", auth, requireBranchMember, async (req, res) => {
 
 /* ══════════════════════════════════════════════
    POST /api/wallet/webhook
-   Kept here as fallback but primary handling
-   is now inside monnifyWebhook.js unified handler.
+   Fallback — primary handling is in the unified
+   monnifyWebhook.js handler.
 ══════════════════════════════════════════════ */
 router.post(
   "/webhook",

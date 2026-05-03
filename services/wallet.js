@@ -7,7 +7,7 @@ const prisma = require("../prismaClient");
 
 const BOOKING_FEE      = 50;
 const LOW_BALANCE_WARN = 1000;
-const BASE_URL         = process.env.MONNIFY_BASE_URL    || "https://sandbox.monnify.com";
+const BASE_URL         = process.env.MONNIFY_BASE_URL     || "https://sandbox.monnify.com";
 const CONTRACT_CODE    = process.env.MONNIFY_CONTRACT_CODE;
 const SECRET_KEY       = process.env.MONNIFY_SECRET_KEY;
 
@@ -132,107 +132,81 @@ async function createMonnifyReservedAccount(token, payload) {
 /* ══════════════════════════════════════════════
    initiateMonnifyFunding
    ──────────────────────────────────────────────
-   On 422 (Monnify sandbox duplicate-ref bug),
-   generates a brand new ref, updates the DB row,
-   and retries once. Never attempts a GET since
-   sandbox always returns 404 for those.
+   Strategy: DB-first.
+
+   Monnify reserved accounts are permanent per
+   customer. We store the account details on the
+   Branch record (walletAccountNumber / walletBankName /
+   walletAccountName) after first creation and read
+   from DB on every subsequent request — Monnify
+   is only called once per branch, ever.
 ══════════════════════════════════════════════ */
 async function initiateMonnifyFunding({ branchId, branchName, amount, reference }) {
-  const token   = await getMonnifyToken();
-  const safeRef = reference.replace(/[^a-zA-Z0-9_-]/g, "");
+  // ── 1. Check DB — return stored account if it exists ────────────
+  const branch = await prisma.branch.findUnique({
+    where:  { id: branchId },
+    select: {
+      walletAccountNumber: true,
+      walletBankName:      true,
+      walletAccountName:   true,
+    },
+  });
 
-  const buildPayload = (acctRef) => ({
+  if (branch?.walletAccountNumber && branch?.walletBankName) {
+    console.log(`[Monnify] ✅ Returning stored wallet account for ${branchName}`);
+    return {
+      accountNumber: branch.walletAccountNumber,
+      bankName:      branch.walletBankName,
+      accountName:   branch.walletAccountName,
+      reference,
+    };
+  }
+
+  // ── 2. No stored account — create one on Monnify ────────────────
+  const token         = await getMonnifyToken();
+  const customerEmail = `wallet.${branchId.slice(0, 8)}@goticket.ng`;
+  const acctRef       = `WALLET-${customerEmail}`;
+
+  const payload = {
     accountReference:    acctRef,
     accountName:         `GoTicket Wallet — ${branchName}`,
-    customerEmail:       `wallet.${branchId.slice(0, 8)}@goticket.ng`,
+    customerEmail,
     customerName:        branchName,
     currencyCode:        "NGN",
     contractCode:        CONTRACT_CODE,
     getAllAvailableBanks: true,
     description:         `GoTicket wallet top-up — ₦${amount}`,
-  });
-
-  let finalRef = safeRef;
-  let body;
-
-  try {
-    const payload = buildPayload(`WALLET-${safeRef}`);
-    console.log("[Monnify] Creating reserved account:", JSON.stringify(payload, null, 2));
-    body = await createMonnifyReservedAccount(token, payload);
-    console.log("[Monnify] Reserved account created: WALLET-" + safeRef);
-
-  } catch (err) {
-    if (err.response?.status !== 422) {
-      console.error("[Monnify] Unexpected error:", err.response?.data || err.message);
-      throw err;
-    }
-
-    // 422 — sandbox bug: ref is "taken" but unretrievable.
-    // Generate a fresh ref and retry once.
-    finalRef = `${safeRef}R${Date.now()}`;
-    console.warn(`[Monnify] 422 on WALLET-${safeRef} — retrying with WALLET-${finalRef}`);
-
-    const retryPayload = buildPayload(`WALLET-${finalRef}`);
-    console.log("[Monnify] Retry payload:", JSON.stringify(retryPayload, null, 2));
-
-    try {
-      body = await createMonnifyReservedAccount(token, retryPayload);
-      console.log("[Monnify] Retry succeeded: WALLET-" + finalRef);
-
-      // Update the DB transaction reference to match the new Monnify ref
-      await prisma.walletTransaction.update({
-        where: { reference: safeRef },
-        data:  { reference: finalRef },
-      });
-
-    } catch (retryErr) {
-      console.error("[Monnify] Retry failed:", retryErr.response?.data || retryErr.message);
-      throw retryErr;
-    }
-  }
-
-  const account = Array.isArray(body.accounts) && body.accounts.length
-    ? body.accounts[0]
-    : body;
-
-  return {
-    accountNumber: account.accountNumber,
-    bankName:      account.bankName,
-    accountName:   body.accountName,
-    reference:     finalRef,
   };
-}
 
-/* ══════════════════════════════════════════════
-   getExistingMonnifyAccount
-   Kept for compatibility — logs clearly if it
-   fails since sandbox doesn't support GET.
-══════════════════════════════════════════════ */
-async function getExistingMonnifyAccount(reference) {
-  const token            = await getMonnifyToken();
-  const accountReference = `WALLET-${reference}`;
-  const encodedRef       = encodeURIComponent(accountReference);
-  const url              = `${BASE_URL}/api/v2/bank-transfer/reserved-accounts/${encodedRef}`;
+  console.log("[Monnify] Creating reserved account:", JSON.stringify(payload, null, 2));
+  const body = await createMonnifyReservedAccount(token, payload);
+  console.log(`[Monnify] ✅ Reserved account created for ${branchName}`);
 
-  console.log(`[Monnify] Fetching existing account: GET ${url}`);
-
-  const { data } = await axios.get(url, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-
-  if (!data.requestSuccessful) {
-    throw new Error(`Could not fetch Monnify account: ${data.responseMessage}`);
-  }
-
-  const body    = data.responseBody;
-  const account = Array.isArray(body.accounts) && body.accounts.length
+  const account     = Array.isArray(body.accounts) && body.accounts.length
     ? body.accounts[0]
     : body;
+  const accountName = body.accountName || `GoTicket Wallet — ${branchName}`;
+
+  // ── 3. Persist to Branch — never call Monnify for this again ────
+  await prisma.branch.update({
+    where: { id: branchId },
+    data: {
+      walletAccountNumber: account.accountNumber,
+      walletBankName:      account.bankName,
+      walletAccountName:   accountName,
+    },
+  });
+
+  console.log(
+    `[Monnify] Stored wallet account for ${branchName} | ` +
+    `${account.bankName} — ${account.accountNumber}`
+  );
 
   return {
     accountNumber: account.accountNumber,
     bankName:      account.bankName,
-    accountName:   body.accountName,
+    accountName,
+    reference,
   };
 }
 
@@ -283,7 +257,6 @@ module.exports = {
   checkAndDeductWallet,
   creditWallet,
   initiateMonnifyFunding,
-  getExistingMonnifyAccount,
   verifyWalletWebhookSignature,
   retryMissingSubAccounts,
   BOOKING_FEE,

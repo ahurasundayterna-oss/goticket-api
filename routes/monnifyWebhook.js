@@ -70,7 +70,7 @@ router.post(
        RESERVED_ACCOUNT → wallet top-up
        Everything else  → booking payment
     ══════════════════════════════════════════════ */
-    const productType = eventData?.product?.type || "";
+    const productType = eventData?.product?.type      || "";
     const productRef  = eventData?.product?.reference || "";
 
     if (productType === "RESERVED_ACCOUNT" && productRef.startsWith("WALLET-")) {
@@ -83,26 +83,54 @@ router.post(
 
 /* ══════════════════════════════════════════════
    WALLET TOP-UP HANDLER
+   ──────────────────────────────────────────────
+   productRef = "WALLET-wallet.{branchId8}@goticket.ng"
+   We extract the branchId prefix from the email,
+   find the branch, then credit its most recent
+   PENDING top-up transaction.
 ══════════════════════════════════════════════ */
 async function handleWalletTopUp({ eventData, productRef, payload }) {
-  // productRef = "WALLET-WFUND-xxx" → strip prefix to get stored reference
-  const reference  = productRef.replace(/^WALLET-/, "");
   const amountPaid = Number(eventData?.amountPaid || eventData?.amount || 0);
 
-  console.log(`[Wallet Webhook] Processing top-up | Ref: ${reference} | Amount: ₦${amountPaid}`);
+  // productRef = "WALLET-wallet.cmopge6r@goticket.ng"
+  // Strip "WALLET-" to get "wallet.cmopge6r@goticket.ng"
+  const customerEmail = productRef.replace(/^WALLET-/, "");
+
+  // Extract branchId prefix: "wallet.cmopge6r@goticket.ng" → "cmopge6r"
+  const branchPrefix = customerEmail.match(/^wallet\.([^@]+)@/)?.[1] || "";
+
+  console.log(`[Wallet Webhook] Top-up | BranchPrefix: ${branchPrefix} | Amount: ₦${amountPaid}`);
+
+  if (!branchPrefix) {
+    console.warn("[Wallet Webhook] Could not extract branch prefix from productRef — skipping");
+    return;
+  }
 
   try {
-    const transaction = await prisma.walletTransaction.findUnique({
-      where: { reference },
+    // Find branch by matching the start of its ID
+    const branch = await prisma.branch.findFirst({
+      where:  { id: { startsWith: branchPrefix } },
+      select: { id: true },
+    });
+
+    if (!branch) {
+      console.warn(`[Wallet Webhook] No branch found for prefix: "${branchPrefix}"`);
+      return;
+    }
+
+    // Find the most recent PENDING top-up for this branch
+    const transaction = await prisma.walletTransaction.findFirst({
+      where:   { branchId: branch.id, type: "CREDIT", status: "PENDING" },
+      orderBy: { createdAt: "desc" },
     });
 
     if (!transaction) {
-      console.warn(`[Wallet Webhook] No transaction found for reference: "${reference}"`);
+      console.warn(`[Wallet Webhook] No PENDING transaction for branch: ${branch.id}`);
       return;
     }
 
     if (transaction.status === "SUCCESS") {
-      console.log(`[Wallet Webhook] Already credited: ${reference} — skipping`);
+      console.log(`[Wallet Webhook] Already credited: ${transaction.reference} — skipping`);
       return;
     }
 
@@ -111,15 +139,15 @@ async function handleWalletTopUp({ eventData, productRef, payload }) {
     await prisma.$transaction(async (tx) => {
       await creditWallet(
         tx,
-        transaction.branchId,
+        branch.id,
         creditAmount,
-        reference,
+        transaction.reference,
         `Wallet top-up confirmed — ₦${creditAmount}`
       );
     });
 
     console.log(
-      `[Wallet Webhook] ✅ Credited ₦${creditAmount} to branch ${transaction.branchId} | Ref: ${reference}`
+      `[Wallet Webhook] ✅ Credited ₦${creditAmount} to branch ${branch.id} | Ref: ${transaction.reference}`
     );
 
   } catch (err) {

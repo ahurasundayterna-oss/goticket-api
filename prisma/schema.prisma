@@ -22,9 +22,17 @@ model Branch {
   name                  String
   parkId                String
   monnifySubAccountCode String?
+
+  // Branch settlement bank account (set during branch creation)
   accountNumber         String?
   bankName              String?
   accountName           String?
+
+  // Monnify wallet reserved account (set once on first top-up, reused forever)
+  walletAccountNumber   String?
+  walletBankName        String?
+  walletAccountName     String?
+
   suspended             Boolean @default(false)
 
   createdAt DateTime @default(now())
