@@ -3,7 +3,7 @@
 
 const axios  = require("axios");
 const crypto = require("crypto");
-const prisma  = require("../prismaClient");
+const prisma = require("../prismaClient");
 
 const BOOKING_FEE      = 50;
 const LOW_BALANCE_WARN = 1000;
@@ -13,7 +13,6 @@ const SECRET_KEY       = process.env.MONNIFY_SECRET_KEY;
 
 /* ══════════════════════════════════════════════
    getMonnifyToken
-   Shared auth helper — gets a fresh access token.
 ══════════════════════════════════════════════ */
 async function getMonnifyToken() {
   const credentials = Buffer.from(
@@ -35,8 +34,6 @@ async function getMonnifyToken() {
 
 /* ══════════════════════════════════════════════
    checkAndDeductWallet
-   Called inside a Prisma $transaction during
-   booking creation. Atomic wallet deduction.
 ══════════════════════════════════════════════ */
 async function checkAndDeductWallet(tx, branchId, reference) {
   const branch = await tx.branch.findUnique({
@@ -87,8 +84,6 @@ async function checkAndDeductWallet(tx, branchId, reference) {
 
 /* ══════════════════════════════════════════════
    creditWallet
-   Credits wallet after confirmed payment.
-   Must be called inside a $transaction.
 ══════════════════════════════════════════════ */
 async function creditWallet(tx, branchId, amount, reference, description) {
   const updated = await tx.branch.update({
@@ -110,21 +105,44 @@ async function creditWallet(tx, branchId, amount, reference, description) {
 }
 
 /* ══════════════════════════════════════════════
+   createMonnifyReservedAccount
+   Internal helper — single POST attempt.
+══════════════════════════════════════════════ */
+async function createMonnifyReservedAccount(token, payload) {
+  const { data } = await axios.post(
+    `${BASE_URL}/api/v2/bank-transfer/reserved-accounts`,
+    payload,
+    {
+      headers: {
+        Authorization:  `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+
+  if (!data.requestSuccessful) {
+    const err = new Error(`Monnify funding init failed: ${data.responseMessage}`);
+    err.monnifyResponse = data;
+    throw err;
+  }
+
+  return data.responseBody;
+}
+
+/* ══════════════════════════════════════════════
    initiateMonnifyFunding
    ──────────────────────────────────────────────
-   Strategy:
-   1. Try to create a new reserved account.
-   2. If Monnify returns 422 (duplicate accountReference),
-      fetch the existing account by that reference instead.
-   This makes the endpoint idempotent — safe to retry.
+   On 422 (Monnify sandbox duplicate-ref bug),
+   generates a brand new ref, updates the DB row,
+   and retries once. Never attempts a GET since
+   sandbox always returns 404 for those.
 ══════════════════════════════════════════════ */
 async function initiateMonnifyFunding({ branchId, branchName, amount, reference }) {
   const token   = await getMonnifyToken();
   const safeRef = reference.replace(/[^a-zA-Z0-9_-]/g, "");
-  const accountReference = `WALLET-${safeRef}`;
 
-  const payload = {
-    accountReference,
+  const buildPayload = (acctRef) => ({
+    accountReference:    acctRef,
     accountName:         `GoTicket Wallet — ${branchName}`,
     customerEmail:       `wallet.${branchId.slice(0, 8)}@goticket.ng`,
     customerName:        branchName,
@@ -132,70 +150,47 @@ async function initiateMonnifyFunding({ branchId, branchName, amount, reference 
     contractCode:        CONTRACT_CODE,
     getAllAvailableBanks: true,
     description:         `GoTicket wallet top-up — ₦${amount}`,
-  };
+  });
 
-  console.log("[Monnify] Creating reserved account:", JSON.stringify(payload, null, 2));
-
+  let finalRef = safeRef;
   let body;
 
   try {
-    const { data } = await axios.post(
-      `${BASE_URL}/api/v2/bank-transfer/reserved-accounts`,
-      payload,
-      {
-        headers: {
-          Authorization:  `Bearer ${token}`,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    if (!data.requestSuccessful) {
-      console.error("[Monnify] Create failed:", JSON.stringify(data, null, 2));
-      throw new Error(`Monnify funding init failed: ${data.responseMessage}`);
-    }
-
-    body = data.responseBody;
-    console.log("[Monnify] Reserved account created:", accountReference);
+    const payload = buildPayload(`WALLET-${safeRef}`);
+    console.log("[Monnify] Creating reserved account:", JSON.stringify(payload, null, 2));
+    body = await createMonnifyReservedAccount(token, payload);
+    console.log("[Monnify] Reserved account created: WALLET-" + safeRef);
 
   } catch (err) {
-    // 422 = accountReference already exists on Monnify — fetch it instead
-    if (err.response?.status === 422) {
-      console.warn(
-        `[Monnify] 422 — accountReference "${accountReference}" already exists. ` +
-        `Fetching existing account...`
-      );
-
-      try {
-        const { data: existing } = await axios.get(
-          `${BASE_URL}/api/v2/bank-transfer/reserved-accounts/details`,
-          {
-            headers: { Authorization: `Bearer ${token}` },
-            params:  { accountReference },
-          }
-        );
-
-        if (!existing.requestSuccessful) {
-          console.error("[Monnify] Fetch existing failed:", JSON.stringify(existing, null, 2));
-          throw new Error(`Could not fetch existing Monnify account: ${existing.responseMessage}`);
-        }
-
-        body = existing.responseBody;
-        console.log("[Monnify] Reusing existing reserved account:", accountReference);
-
-      } catch (fetchErr) {
-        console.error("[Monnify] Fetch existing account error:", fetchErr.message);
-        throw fetchErr;
-      }
-
-    } else {
-      // Some other error — rethrow
+    if (err.response?.status !== 422) {
       console.error("[Monnify] Unexpected error:", err.response?.data || err.message);
       throw err;
     }
+
+    // 422 — sandbox bug: ref is "taken" but unretrievable.
+    // Generate a fresh ref and retry once.
+    finalRef = `${safeRef}R${Date.now()}`;
+    console.warn(`[Monnify] 422 on WALLET-${safeRef} — retrying with WALLET-${finalRef}`);
+
+    const retryPayload = buildPayload(`WALLET-${finalRef}`);
+    console.log("[Monnify] Retry payload:", JSON.stringify(retryPayload, null, 2));
+
+    try {
+      body = await createMonnifyReservedAccount(token, retryPayload);
+      console.log("[Monnify] Retry succeeded: WALLET-" + finalRef);
+
+      // Update the DB transaction reference to match the new Monnify ref
+      await prisma.walletTransaction.update({
+        where: { reference: safeRef },
+        data:  { reference: finalRef },
+      });
+
+    } catch (retryErr) {
+      console.error("[Monnify] Retry failed:", retryErr.response?.data || retryErr.message);
+      throw retryErr;
+    }
   }
 
-  // Extract account details — Monnify returns accounts[] array
   const account = Array.isArray(body.accounts) && body.accounts.length
     ? body.accounts[0]
     : body;
@@ -204,52 +199,41 @@ async function initiateMonnifyFunding({ branchId, branchName, amount, reference 
     accountNumber: account.accountNumber,
     bankName:      account.bankName,
     accountName:   body.accountName,
-    reference:     safeRef,
+    reference:     finalRef,
   };
 }
 
 /* ══════════════════════════════════════════════
    getExistingMonnifyAccount
-   Fetches a previously created reserved account
-   from Monnify by its accountReference.
+   Kept for compatibility — logs clearly if it
+   fails since sandbox doesn't support GET.
 ══════════════════════════════════════════════ */
 async function getExistingMonnifyAccount(reference) {
   const token            = await getMonnifyToken();
   const accountReference = `WALLET-${reference}`;
   const encodedRef       = encodeURIComponent(accountReference);
+  const url              = `${BASE_URL}/api/v2/bank-transfer/reserved-accounts/${encodedRef}`;
 
-  // Monnify sandbox: GET /api/v2/bank-transfer/reserved-accounts/{accountReference}
-  const url = `${BASE_URL}/api/v2/bank-transfer/reserved-accounts/${encodedRef}`;
   console.log(`[Monnify] Fetching existing account: GET ${url}`);
 
-  try {
-    const { data } = await axios.get(url, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+  const { data } = await axios.get(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
 
-    console.log("[Monnify] Fetch response:", JSON.stringify(data, null, 2));
-
-    if (!data.requestSuccessful) {
-      throw new Error(`Could not fetch Monnify account: ${data.responseMessage}`);
-    }
-
-    const body    = data.responseBody;
-    const account = Array.isArray(body.accounts) && body.accounts.length
-      ? body.accounts[0]
-      : body;
-
-    return {
-      accountNumber: account.accountNumber,
-      bankName:      account.bankName,
-      accountName:   body.accountName,
-    };
-
-  } catch (err) {
-    const status  = err.response?.status;
-    const errBody = err.response?.data;
-    console.error(`[Monnify] GET reserved account failed (${status}):`, JSON.stringify(errBody || err.message));
-    throw err;
+  if (!data.requestSuccessful) {
+    throw new Error(`Could not fetch Monnify account: ${data.responseMessage}`);
   }
+
+  const body    = data.responseBody;
+  const account = Array.isArray(body.accounts) && body.accounts.length
+    ? body.accounts[0]
+    : body;
+
+  return {
+    accountNumber: account.accountNumber,
+    bankName:      account.bankName,
+    accountName:   body.accountName,
+  };
 }
 
 /* ══════════════════════════════════════════════
