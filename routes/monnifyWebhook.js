@@ -157,9 +157,16 @@ async function handleWalletTopUp({ eventData, productRef, payload }) {
 
 /* ══════════════════════════════════════════════
    BOOKING PAYMENT HANDLER
+   ──────────────────────────────────────────────
+   paymentReference is resolved from product.reference
+   first — this is the GoTicket booking ref (GT-xxx)
+   that was stored on the booking at creation time.
+   Monnify's own paymentReference is their internal
+   ref and does not match our booking records.
 ══════════════════════════════════════════════ */
 async function handleBookingPayment({ eventType, eventData, payload }) {
-  const paymentReference = eventData?.accountReference
+  const paymentReference = eventData?.product?.reference
+    || eventData?.accountReference
     || eventData?.paymentReference
     || "UNKNOWN";
 
