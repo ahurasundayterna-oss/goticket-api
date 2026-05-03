@@ -354,7 +354,6 @@ Type *menu* to go back.`);
         } else if (msg === "2") {
           date = getTomorrowWAT();
         } else {
-          // Try NLP first, then manual parse
           date = resolveDate(rawMsg) || parseDate(rawMsg);
         }
 
@@ -388,7 +387,6 @@ Type *menu* to try another date.`);
       session.parkOptions = parkOptions;
       session.step        = "SELECT_PARK";
 
-      // NLU auto-select if only one option
       if (parkOptions.length === 1 && session._nluApplied) {
         session._nluApplied = false;
         return handleParkSelection(res, session, 0);
@@ -621,38 +619,63 @@ Type *menu* to search again.`);
         console.warn(`[WhatsApp] No sub-account for branch ${trip.branchId} — using main account`);
       }
 
-      // ── Create Monnify virtual account ────────────────────────────
+      // ── Create or reuse Monnify virtual account ───────────────────
+      // Monnify allows only one reserved account per customer email.
+      // We derive the email from the passenger's phone number, so we
+      // check if this passenger already has a virtual account from a
+      // previous booking and reuse those details if so.
       let accountNumber, bankName;
 
-      try {
-        const result = await createVirtualAccount({
-          reference:      primaryRef,
-          passengerName:  session.passengerName,
+      const previousBooking = await prisma.booking.findFirst({
+        where: {
           passengerPhone: session.passengerPhone,
-          ticketPrice:    ticketTotal,
-          description:    `GoTicket: ${session.from} → ${session.to} (${session.seats} seat${session.seats > 1 ? "s" : ""})`,
-          subAccountCode,
-        });
+          accountNumber:  { not: null },
+          bankName:       { not: null },
+        },
+        orderBy: { createdAt: "desc" },
+        select:  { accountNumber: true, bankName: true },
+      });
 
-        accountNumber = result.accountNumber;
-        bankName      = result.bankName;
+      if (previousBooking?.accountNumber && previousBooking?.bankName) {
+        console.log(`[Monnify] Reusing existing virtual account for ${session.passengerPhone}`);
+        accountNumber = previousBooking.accountNumber;
+        bankName      = previousBooking.bankName;
 
         await prisma.booking.updateMany({
           where: { id: { in: bookingIds } },
           data:  { accountNumber, bankName, paymentReference: primaryRef },
         });
 
-      } catch (monnifyErr) {
-        console.error("[Monnify] Virtual account failed:", monnifyErr.message);
-        clearSession(phone);
+      } else {
+        try {
+          const result = await createVirtualAccount({
+            reference:      primaryRef,
+            passengerName:  session.passengerName,
+            passengerPhone: session.passengerPhone,
+            ticketPrice:    ticketTotal,
+            description:    `GoTicket: ${session.from} → ${session.to} (${session.seats} seat${session.seats > 1 ? "s" : ""})`,
+            subAccountCode,
+          });
 
-        const refList = refs.map((r, i) =>
-          session.seats > 1
-            ? `  Seat ${freshBookings + i + 1}: *${r}*`
-            : `*${r}*`
-        ).join("\n");
+          accountNumber = result.accountNumber;
+          bankName      = result.bankName;
 
-        return twimlReply(res,
+          await prisma.booking.updateMany({
+            where: { id: { in: bookingIds } },
+            data:  { accountNumber, bankName, paymentReference: primaryRef },
+          });
+
+        } catch (monnifyErr) {
+          console.error("[Monnify] Virtual account failed:", monnifyErr.message);
+          clearSession(phone);
+
+          const refList = refs.map((r, i) =>
+            session.seats > 1
+              ? `  Seat ${freshBookings + i + 1}: *${r}*`
+              : `*${r}*`
+          ).join("\n");
+
+          return twimlReply(res,
 `⚠️ *Booking Created — Payment Setup Delayed*
 
 Your seat${session.seats > 1 ? "s have" : " has"} been reserved but we couldn't generate your payment account right now.
@@ -664,6 +687,7 @@ Please contact support:
 📞 +234 800 000 0000
 
 Type *menu* to return.`);
+        }
       }
 
       clearSession(phone);
